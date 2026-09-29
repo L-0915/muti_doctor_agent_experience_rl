@@ -1,10 +1,8 @@
-"""Translate the cold-start SFT train/dev JSONL to English with an LLM.
+"""Translate the cold-start SFT train/dev dialogue turns to English.
 
-Only natural-language content is translated. The static system prompt remains
-in scripts/sys_prompt.py and is not written into translated records. Message
-roles, the doctor-visible profile schema, and the ASK/FINAL target structure
-are preserved. The source files are never modified. Requires an OpenAI-compatible
-endpoint configured by data/.env (API_KEY, BASE_URL, BASE_MODEL) or HEAPO_LLM_*.
+Only original conversation messages and their ASK/FINAL target text are sent.
+No patient chart or dialogue-derived profile is added. The static system prompt
+stays in scripts/sys_prompt.py. Source files are never modified.
 """
 from __future__ import annotations
 
@@ -22,9 +20,6 @@ from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = ROOT / "data/processed/sft_clean"
-PROFILE_HEADER = "Known patient profile (derived only from patient messages visible so far):"
-PROFILE_SEPARATOR = "\n\nCurrent patient message:\n"
-PROFILE_TEXT_KEYS = ("history_mentions", "medication_mentions", "allergy_mentions")
 TRANSLATION_VERSION = "sft-english-v1"
 CJK = re.compile(r"[\u3400-\u9fff]")
 NUMBERS = re.compile(r"\d+(?:\.\d+)?")
@@ -90,24 +85,13 @@ def prepare_record(record: dict) -> tuple[list[dict], dict, list[dict]]:
             or messages[-1].get("role") != "assistant"
             or parse_action(messages[-1].get("content")) is None):
         raise ValueError("Malformed SFT conversation or final action")
-    profile = None
     first_user = messages[0]
     if first_user.get("role") != "user":
         raise ValueError("Conversation must start with a patient message")
-    if first_user["content"].startswith(PROFILE_HEADER + "\n"):
-        raw_profile, separator, _ = first_user["content"][len(PROFILE_HEADER) + 1:].partition(
-            PROFILE_SEPARATOR)
-        if not separator:
-            raise ValueError("Malformed doctor-visible patient profile prefix")
-        profile = json.loads(raw_profile)
-        if (not isinstance(profile, dict)
-                or set(profile) != {"age_years", "sex", *PROFILE_TEXT_KEYS}
-                or not isinstance(profile["age_years"], (int, type(None)))
-                or profile["sex"] not in {None, "男", "女"}
-                or any(not isinstance(profile[key], list)
-                       or any(not isinstance(x, str) for x in profile[key])
-                       for key in PROFILE_TEXT_KEYS)):
-            raise ValueError("Unexpected patient profile structure")
+    if any(marker in first_user["content"] for marker in (
+            "Known patient profile", "已公开患者档案",
+            "患者就诊病历（本次诊断和建议不放入输入）")):
+        raise ValueError("Chart/profile found in SFT input; rebuild from original dialogue turns")
     items = []
     plan = []
     for index, message in enumerate(messages):
@@ -120,21 +104,12 @@ def prepare_record(record: dict) -> tuple[list[dict], dict, list[dict]]:
         action = parse_action(message["content"]) if message["role"] == "assistant" else None
         item_id = f"m{index}"
         text = action["message"] if action else message["content"]
-        if index == 0 and profile is not None:
-            _, _, text = text[len(PROFILE_HEADER) + 1:].partition(PROFILE_SEPARATOR)
         if not text.strip():
             raise ValueError("Empty doctor action message")
         items.append({"id": item_id, "role": message["role"], "text": text})
         plan.append({"id": item_id, "role": message["role"],
-                     "action": action["action"] if action else None,
-                     "has_profile": index == 0 and profile is not None})
-    if profile:
-        for key in PROFILE_TEXT_KEYS:
-            for index, text in enumerate(profile[key]):
-                if not text.strip():
-                    raise ValueError("Empty patient profile mention")
-                items.append({"id": f"p.{key}.{index}", "role": "patient_profile", "text": text})
-    return items, {"profile": profile}, plan
+                     "action": action["action"] if action else None})
+    return items, {}, plan
 
 
 def validate_translations(items: list[dict], result: dict) -> dict[str, str]:
@@ -157,19 +132,9 @@ def validate_translations(items: list[dict], result: dict) -> dict[str, str]:
 
 
 def build_record(record: dict, context: dict, plan: list[dict], translated: dict[str, str]) -> dict:
-    profile = context["profile"]
-    profile_en = None
-    if profile is not None:
-        profile_en = dict(profile)
-        profile_en["sex"] = {"男": "male", "女": "female", None: None}[profile["sex"]]
-        for key in PROFILE_TEXT_KEYS:
-            profile_en[key] = [translated[f"p.{key}.{i}"] for i in range(len(profile[key]))]
     messages = []
     for entry in plan:
         english = translated[entry["id"]]
-        if entry.get("has_profile"):
-            profile_json = json.dumps(profile_en, ensure_ascii=False, separators=(",", ":"))
-            english = (f"{PROFILE_HEADER}\n{profile_json}{PROFILE_SEPARATOR}{english}")
         if entry["action"]:
             english = json.dumps({"action": entry["action"], "message": english},
                                  ensure_ascii=False, separators=(",", ":"))
