@@ -20,6 +20,8 @@ import pyarrow.parquet as pq
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INPUT = ROOT / "data/processed/train.parquet"
+if not DEFAULT_INPUT.exists():  # public repository keeps the RL Parquet at its root
+    DEFAULT_INPUT = ROOT / "train.parquet"
 DEFAULT_OUTPUT = ROOT / "data/processed/sft_clean"
 DEFAULT_AUDIT = ROOT / "data/audit/sft_cleaning"
 RULE_VERSION = "sft-clean-v5"
