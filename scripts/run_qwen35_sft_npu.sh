@@ -26,6 +26,11 @@ if ! command -v swift >/dev/null 2>&1; then
   echo "ms-swift is not installed in this environment (swift command missing)." >&2
   exit 1
 fi
+SYSTEM_PROMPT="$(python "$SCRIPT_DIR/sys_prompt.py")"
+if [[ -z "$SYSTEM_PROMPT" ]]; then
+  echo "Failed to load the shared system prompt from scripts/sys_prompt.py" >&2
+  exit 1
+fi
 
 # Cold-start SFT can start on 8 of the available NPUs.
 export NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
@@ -39,6 +44,7 @@ fi
 
 COMMON_ARGS=(
   --model "$MODEL_PATH"
+  --system "$SYSTEM_PROMPT"
   --dataset "$TRAIN_FILE"
   --val_dataset "$DEV_FILE"
   --split_dataset_ratio 0

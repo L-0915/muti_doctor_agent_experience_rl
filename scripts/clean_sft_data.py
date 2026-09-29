@@ -24,9 +24,11 @@ if not DEFAULT_INPUT.exists():  # public repository keeps the RL Parquet at its 
     DEFAULT_INPUT = ROOT / "train.parquet"
 DEFAULT_OUTPUT = ROOT / "data/processed/sft_clean"
 DEFAULT_AUDIT = ROOT / "data/audit/sft_cleaning"
-RULE_VERSION = "sft-clean-v5"
+RULE_VERSION = "sft-clean-v6"
 ACTION_KEYS = {"action", "message"}
 SYSTEM_PROFILE_MARKER = "\n\n已公开患者档案（仅来自当前可见患者发言）："
+PROFILE_HEADER = "Known patient profile (derived only from patient messages visible so far):"
+PATIENT_HEADER = "Current patient message:"
 HAN = re.compile(r"[\u3400-\u9fff]")
 DIRECT_PII = re.compile(
     r"(?<!\d)1[3-9]\d{9}(?!\d)|(?<!\d)\d{17}[\dXx](?!\d)|"
@@ -112,6 +114,15 @@ def normalize(text: str) -> str:
     return text.strip()
 
 
+def patient_utterance(text: str) -> str:
+    if text.startswith(PROFILE_HEADER + "\n"):
+        _, separator, content = text[len(PROFILE_HEADER) + 1:].partition(
+            "\n\n" + PATIENT_HEADER + "\n")
+        if separator:
+            return content
+    return text
+
+
 def action_from(message: dict) -> dict | None:
     try:
         target = json.loads(message["content"])
@@ -135,13 +146,12 @@ def red_flag_present(patient_text: str) -> bool:
 def screen(record: dict) -> tuple[dict | None, list[str]]:
     reasons = []
     messages = record.get("messages") if isinstance(record, dict) else None
-    if not isinstance(messages, list) or len(messages) < 3 or len(messages) % 2 == 0:
+    if not isinstance(messages, list) or len(messages) < 2 or len(messages) % 2 != 0:
         return None, ["invalid_structure"]
-    if (messages[0].get("role") != "system"
-            or any(not isinstance(m, dict) or set(m) != {"role", "content"}
-                   or m["role"] != ("user" if index % 2 else "assistant")
-                   or not isinstance(m["content"], str) or not m["content"].strip()
-                   for index, m in enumerate(messages[1:], 1))):
+    if any(not isinstance(m, dict) or set(m) != {"role", "content"}
+           or m["role"] != ("user" if index % 2 == 0 else "assistant")
+           or not isinstance(m["content"], str) or not m["content"].strip()
+           for index, m in enumerate(messages)):
         return None, ["invalid_structure"]
     target = action_from(messages[-1])
     if target is None:
@@ -149,10 +159,11 @@ def screen(record: dict) -> tuple[dict | None, list[str]]:
     doctor_text = normalize(target["message"])
     if not doctor_text or len(doctor_text) > 350:
         return None, ["target_length"]
-    patient = [normalize(m["content"]) for m in messages if m["role"] == "user"]
-    history_doctor = [normalize(m["content"]) for m in messages[1:-1]
+    patient_full = [normalize(m["content"]) for m in messages if m["role"] == "user"]
+    patient = [normalize(patient_utterance(text)) for text in patient_full]
+    history_doctor = [normalize(m["content"]) for m in messages[:-1]
                       if m["role"] == "assistant"]
-    all_visible = [messages[0]["content"]] + patient + history_doctor + [doctor_text]
+    all_visible = patient_full + history_doctor + [doctor_text]
     if any(DIRECT_PII.search(x) for x in all_visible):
         reasons.append("direct_identifier_or_link")
     if any(GARBLED.search(x) for x in all_visible):
@@ -278,9 +289,34 @@ def source_candidate(row: dict) -> tuple[dict | None, str | None]:
     action, text = reference["logged_action"], reference["logged_response"]
     if action not in {"ASK", "FINAL"} or not isinstance(text, str) or not text.strip():
         return None, "missing_aligned_logged_response"
+    source_messages = row["messages"]
+    if not source_messages or source_messages[0].get("role") != "system":
+        return None, "invalid_source_messages"
+    system_text = source_messages[0].get("content", "")
+    _, marker, raw_profile = system_text.partition(SYSTEM_PROFILE_MARKER)
+    visible_messages = [dict(message) for message in source_messages[1:]]
+    if not visible_messages or visible_messages[0].get("role") != "user":
+        return None, "invalid_source_messages"
+    if marker:
+        try:
+            profile = json.loads(raw_profile)
+        except json.JSONDecodeError:
+            return None, "invalid_visible_profile"
+        if (not isinstance(profile, dict)
+                or set(profile) != {"age_years", "sex", "history_mentions",
+                                    "medication_mentions", "allergy_mentions"}):
+            return None, "invalid_visible_profile"
+        has_profile = (profile["age_years"] is not None or profile["sex"] is not None
+                       or any(profile[key] for key in (
+                           "history_mentions", "medication_mentions", "allergy_mentions")))
+        if has_profile:
+            profile_json = json.dumps(profile, ensure_ascii=False, separators=(",", ":"))
+            visible_messages[0]["content"] = (
+                f"{PROFILE_HEADER}\n{profile_json}\n\n{PATIENT_HEADER}\n"
+                f"{visible_messages[0]['content']}")
     target = json.dumps({"action": action, "message": text}, ensure_ascii=False,
                         separators=(",", ":"))
-    return {"messages": [*row["messages"], {"role": "assistant", "content": target}]}, None
+    return {"messages": [*visible_messages, {"role": "assistant", "content": target}]}, None
 
 
 def reservoir_add(pool: list, seen_count: int, item: tuple, rng: random.Random) -> None:
