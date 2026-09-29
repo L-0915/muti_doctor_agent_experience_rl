@@ -1,423 +1,500 @@
-"""Conservatively select clean cold-start SFT conversations with zero API calls.
+"""Build complete, case-level SFT episodes from IMCS-V2-MRG without LLM calls.
 
-Rules remove obvious dialogue artifacts and unsuitable targets. They do not
-verify diagnoses or certify clinical quality. Source JSONL is never modified.
+The source includes an annotated six-section medical report. Diagnosis and
+recommendations are excluded from the doctor-visible profile. When the logged
+dialogue lacks a diagnostic close, those source annotations provide a clearly
+counted, deterministic final answer. No LLM calls are made.
 """
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 import csv
+from collections import Counter
 import hashlib
 import json
-from pathlib import Path
 import random
 import re
 import unicodedata
-
-import pyarrow.parquet as pq
+from pathlib import Path
+from zipfile import ZipFile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_INPUT = ROOT / "data/processed/train.parquet"
-if not DEFAULT_INPUT.exists():  # public repository keeps the RL Parquet at its root
-    DEFAULT_INPUT = ROOT / "train.parquet"
+DEFAULT_SOURCE = ROOT / "data/raw/IMCS-V2-MRG.zip"
 DEFAULT_OUTPUT = ROOT / "data/processed/sft_clean"
 DEFAULT_AUDIT = ROOT / "data/audit/sft_cleaning"
-RULE_VERSION = "sft-clean-v6"
-ACTION_KEYS = {"action", "message"}
-SYSTEM_PROFILE_MARKER = "\n\n已公开患者档案（仅来自当前可见患者发言）："
-PROFILE_HEADER = "Known patient profile (derived only from patient messages visible so far):"
-PATIENT_HEADER = "Current patient message:"
-HAN = re.compile(r"[\u3400-\u9fff]")
-DIRECT_PII = re.compile(
-    r"(?<!\d)1[3-9]\d{9}(?!\d)|(?<!\d)\d{17}[\dXx](?!\d)|"
-    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b|"
-    r"https?://\S+|(?:微信|qq|QQ)[:：号\s]*[A-Za-z0-9_-]{5,}"
+
+REPORT_FIELDS = ("主诉", "现病史", "辅助检查", "既往史", "诊断", "建议")
+PROFILE_FIELDS = ("主诉", "现病史", "辅助检查", "既往史")
+UNKNOWN_HISTORY = re.compile(r"不详|未知|无记录|不清楚|不明确|资料缺如|病史不详")
+EMPTY_FINAL_FIELD = re.compile(r"^(?:暂无?|无|未查|待查|不详|未知|无特殊|无异常)[。！!；;，, ]*$")
+DIAGNOSIS_CUE = re.compile(
+    r"诊断|考虑|倾向|怀疑|初步判断|初步考虑|不排除|可能是|可能为|符合"
 )
-GARBLED = re.compile(r"[\ufffd\u0000-\u0008\u000b\u000e-\u001f]|<\/?(?:div|span|br|p)\b|\\u[0-9a-fA-F]{4}")
-TARGET_TYPO = re.compile(r"[，,]{2,}|[。\.]{2,}|[？?]{2,}|有不部分|慢长|即刻住院胸|复发不会比以前严重")
-RATING = re.compile(r"好评|五星|满意.{0,8}评价|评价.{0,8}满意|给.{0,5}评价|打分|点赞|收藏|关注.{0,8}(?:我|医生)")
-PROMOTION = re.compile(r"私人医生|扫码|二维码|微信公众号|关注.{0,8}(?:头像|微博|公众号)|点击头像|优惠券|复诊卡|加微信|添加微信")
-PLATFORM = re.compile(
-    r"\[自动回复\]|【自动回复】|医生留言|医生给您发来一个提醒|"
-    r"针对本次问诊.{0,8}(?:总结|建议)|病情资料我已详细阅读|"
-    r"报到来源|患病多久[:：]|希望获得的帮助[:：]|病情变化情况[:：]|"
-    r"是否开了检查[:：]|是否拿到检查结果[:：]|开药需求[:：]|"
-    r"您好.{0,30}长时间没反馈|有问题请留言|真情寄语|微信上传"
+ADVICE_CUE = re.compile(
+    r"建议|需要|应当|应该|最好|可先|就诊|检查|复查|治疗|观察|随访|"
+    r"注意|避免|休息|尽快|急诊|门诊|医院|监测"
+)
+NOISE_PATTERNS = (
+    re.compile(r"(?:给个|给一下|留下|点个|帮忙).{0,8}(?:好评|五星|评价|满意)"),
+    re.compile(r"(?:麻烦|请|劳烦|希望).{0,10}(?:给个|点个|留下|评价|好评|五星)"),
+    re.compile(r"(?:好评|五星好评|服务评价|满意度评价).{0,8}(?:谢谢|感谢|哦|哟)?"),
+    re.compile(
+        r"(?:问诊|问答|提问|回复).{0,8}(?:次数|上限|限制)|"
+        r"(?:最多|还剩|仅剩|剩余)\s*\d{1,2}\s*(?:次|轮)|"
+        r"(?:系统|平台|本次).{0,8}(?:规定|限制|上限).{0,12}(?:次|轮|提问|问诊|问答)"
+    ),
 )
 MEDIA_DEPENDENCE = re.compile(
-    r"图片因隐私问题无法显示|患者曾上传图片|看图|上图|这张图|图片上|照片上|"
-    r"图片|照片|相片|片子|影像资料|上传.{0,6}(?:图|照片)|报告单|化验单|"
-    r"(?:拍|发).{0,6}(?:照|图)|(?:发|上传).{0,12}(?:报告|病历|影像|ct|CT|b超|B超)|"
-    r"(?:初步|乍).{0,4}看(?:来|着)|从外观|"
-    r"语音因隐私问题无法显示|音频因隐私问题无法显示|视频因隐私问题无法显示"
+    r"图片因隐私问题无法显示|图片(?:未显示|无法显示|看不清)|"
+    r"(?:请|麻烦)?(?:上传|发一下|看一下)(?:图片|照片|报告|影像)|"
+    r"无法查看图片|看图才能|根据图片"
 )
-COURTESY_ONLY = re.compile(
-    r"^(?:嗯+|哦+|好(?:的|吧|了)?|知道了|明白了|收到|谢谢(?:你|您|医生|大夫)?|"
-    r"多谢(?:你|您|医生|大夫)?|辛苦了|不客气|再见)[!！。,.，~～\s]*$"
+GARBLED = re.compile(r"[\ufffd\u0000-\u0008\u000b\u000e-\u001f]|</?[a-z][^>]*>|锟斤拷")
+DIRECT_PII = re.compile(
+    r"(?<!\d)1[3-9]\d{9}(?!\d)|(?<!\d)\d{15}(?:\d{2}[\dXx])?(?!\d)|"
+    r"(?<!\d)0\d{2,3}[- ]?\d{7,8}(?!\d)|"
+    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b|https?://\S+"
 )
-ACK_ONLY = re.compile(r"^(?:是(?:的)?|对(?:的)?|没错|不是|没有|有|嗯+|好(?:的|吧)?)[!！。,.，~～\s]*$")
-LOW_INFO_ASK = re.compile(
-    r"^(?:您好|你好|请问|医生)?[,，:\s]*(?:还有吗|什么症状|有其他症状吗|"
-    r"还有其他症状吗|还有别的不舒服吗|有其他不舒服吗|还有什么问题吗|"
-    r"想咨询什么问题呢|有什么问题呢|怎么了)[?？]$"
+REPEATED_PUNCTUATION = re.compile(r"[！？?!，。；、]{4,}")
+NAME_INTRO = re.compile(
+    r"(?:本人(?:的名字叫|名叫|叫|姓名)|我(?:的名字叫|名叫|叫)|"
+    r"(?:患者|就诊人)姓名)\s*[:：]?\s*(?P<name>[\u4e00-\u9fff]{2,4})"
+    r"(?=[，。；;：:、,.\s]|$)"
 )
-GENERIC_SYMPTOM_ASK = re.compile(r"(?:还|另|其).{0,5}(?:什么|其他|别的).{0,5}(?:症状|不舒服)|(?:有|出现).{0,3}(?:什么|其他).{0,3}症状")
-QUESTION_CUE = re.compile(r"有没有|是否|有无|什么|怎么|哪里|哪|多久|多长|多少|几|吗|呢|用过|做过|会不会|能否")
-ASK_ADVICE = re.compile(
-    r"建议|应该|可以吃|可以用|需要服用|先吃|先用|口服|治疗|诊断为|考虑是|"
-    r"不用担心|没有问题|多喝水|注意休息|去医院|到医院|药店"
+NAME_STOP = {"医生", "主任", "朋友", "妈妈", "爸爸", "老师", "不要", "帮我", "患者"}
+PRIVACY_RULES = (
+    ("url", re.compile(r"https?://[^\s<>，。；;]+", re.I), "[链接已隐去]"),
+    ("email", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "[邮箱已隐去]"),
+    ("id_card", re.compile(r"(?<!\d)(?:\d{17}[\dXx]|\d{15})(?!\d)"), "[证件号已隐去]"),
+    ("mobile", re.compile(r"(?<!\d)(?:\+?86[- ]?)?1[3-9](?:[- ]?\d){9}(?!\d)"), "[电话已隐去]"),
+    ("landline", re.compile(r"(?<!\d)0\d{2,3}[- ]?\d{7,8}(?!\d)"), "[电话已隐去]"),
+    ("account", re.compile(r"(?:微信|QQ|扣扣|wx|vx)(?:号|号码)?\s*(?:是|为|[:：])?\s*[A-Za-z0-9_-]{5,20}", re.I), "[账号已隐去]"),
+    ("record_number", re.compile(r"(?:病历号|住院号|就诊号|门诊号)\s*[:：]?\s*[A-Za-z0-9-]{5,24}"), "[病历编号已隐去]"),
+    ("birth_date", re.compile(r"(?:出生日期|出生年月|生日)\s*[:：]?\s*\d{4}[-/.年]\d{1,2}(?:[-/.月]\d{1,2}日?)?"), "[出生日期已隐去]"),
+    ("address", re.compile(r"(?:家庭住址|居住地址|地址|住址)\s*[:：]\s*[^，。；;\n]{3,100}"), "[地址已隐去]"),
 )
-FINAL_FALLBACK = re.compile(r"不客气|祝.{0,12}(?:健康|康复|愉快)|随时联系|有问题再问|我的解答|谢谢.{0,8}信任")
-FINAL_CONTENT = re.compile(r"建议|需要|应当|注意|观察|复查|检查|就医|医院|门诊|急诊|如果|若|可能|风险|避免")
-FINAL_ACTION = re.compile(r"建议|需要|应当|注意|观察|复查|检查|就医|急诊|及时|尽快|请到|请去")
-FINAL_CAUTION = re.compile(r"可能|考虑|建议|如果|若|需要|应当|注意|风险|暂时|目前|请|尽快")
-FINAL_NEXT_STEP = re.compile(r"复查|检查|就医|医院|门诊|急诊|观察|留意|监测|随访")
-INSTITUTIONAL_REPLY = re.compile(r"我们医院|我院|本院|我科|门诊在周|地址是|费用|预约|挂.{0,4}号|专家号|我现在在.{0,8}下乡|身份证|医保卡|就诊卡|特需门诊|我每周.{0,12}门诊|周[一二三四五六日].{0,8}门诊|(?:上海|北京|浙江|江苏|中山|瑞金).{0,8}医院")
-TREATMENT_CERTAINTY = re.compile(r"(?:可以只|只要|完全可以|不需要|没有必要|不用).{0,12}(?:疫苗|检查|手术|治疗|复查|住院|就医)")
-PROCEDURE_DIRECTIVE = re.compile(r"(?:建议|需要|可以|应当).{0,8}(?:手术|移植|化疗|放疗|注射|输液)|最好拔|建议拔|可以一起吃|没有任何副作用|一刀永逸|放粒子|伽马刀|粒子植入")
-UNPROFESSIONAL_REPLY = re.compile(r"呵呵|哈哈|亲[，,\s]|我个头|快给|科普文章|来我这|已经给你说过|我都说了|懒得解释|自己思考|首先.{0,6}我说了|没有医生不")
-DIRECT_DRUG_VERB = re.compile(
-    r"(?:吃|服|用|涂抹|注射|打).{0,12}(?:药|片|胶囊|颗粒|丸|乳膏|软膏|针|"
-    r"霉素|唑|林|汀|丁啉|沙坦|普利)|(?:奥美拉唑|吗丁啉|华法林|阿司匹林|激素)"
+PRIVACY_COUNTS: Counter = Counter()
+EXPLICIT_NAME_CASES = 0
+TRAILING_CLOSER = re.compile(
+    r"^(?:不客气|不用谢|再见|祝好|谢谢|感谢|有问题.{0,12}(?:再问|联系)|"
+    r"希望对您有帮助)[！!。．.\s]*$"
 )
-UNSUPPORTED_DIAGNOSIS = re.compile(r"(?:就是|属于|确诊为|我(?:的)?诊断是).{0,8}(?:炎|病|癣|癌|结核|感染|障碍)")
-DIRECT_DRUG_ADVICE = re.compile(
-    r"(?:口服|服用|吃|使用|应用|注射|停用|停药|换药|减量|加量).{0,12}"
-    r"(?:药|片|胶囊|颗粒|糖浆|滴剂|抗生素)|"
-    r"(?:每次|每日|每天|一天|每晚|每早).{0,18}(?:片|粒|次|毫克|mg|ml|毫升)|"
-    r"\d+(?:\.\d+)?\s*(?:毫克|mg|ml|毫升|片|粒).{0,18}(?:服|吃|用|次)"
+ASSESSMENT_BEFORE = re.compile(
+    r"(?:诊断(?:为|是)?|考虑(?:为|是)?|怀疑(?:为|是)?|倾向于?|可能(?:是|为)|"
+    r"不排除|符合|判断(?:为|是)?|症状(?:是|考虑|为|还是)|"
+    r"(?:目前|现在).{0,8}(?:是|属于)|就是|属于|患有)"
 )
-ANY_MEDICATION_IN_FINAL = re.compile(r"药|服用|口服|抗生素|激素|胶囊|颗粒|软膏|乳膏|注射|输液|打针")
-OVERCONFIDENT = re.compile(r"绝对|肯定没|一定没|肯定是|就是.{0,12}(?:癌|炎|病)|不用检查|完全不用担心|不可能有事|不可能查出|可以基本确诊|100%|百分之百")
-# These are high-risk review cues, not a diagnosis. Matched cases are kept only
-# when the target is a FINAL action with explicit urgent-care instructions.
-RED_FLAG = re.compile(
-    r"咳血|咯血|痰中带血|血痰|吐血|呕血|大量出血|血流不止|意识模糊|神志不清|"
-    r"突然意识|呼吸困难|喘不过气|胸痛|胸口剧痛|昏厥|昏迷|抽搐|"
-    r"自杀|轻生|想死|肢体突然无力|突然说不出话"
-)
-NEGATION_BEFORE = re.compile(r"(?:没有|没|无|否认|未|不|排除|不是|并无)$")
-URGENT_CARE = re.compile(r"(?:立即|立刻|马上|尽快|及时).{0,8}(?:急诊|就医|去医院)|急诊|拨打120|叫救护车")
-DURATION_MENTION = re.compile(r"(?:\d+(?:\.\d+)?|[一二两三四五六七八九十半])\s*(?:个)?(?:小时|分钟|天|日|周|星期|月|年)")
-GENERIC_DURATION_ASK = re.compile(r"(?:这种情况|这个情况|这情况|症状|不舒服)?.{0,6}(?:多久|多长时间|什么时候开始|几天了|几个月了)")
-AGE_MENTION = re.compile(r"(?:\d{1,3}|[一二两三四五六七八九十]+)\s*(?:岁|个月|月龄)")
-AGE_ASK = re.compile(r"(?:几岁|多大|年龄|几个月|才.{0,3}(?:岁|个月))")
-ASSERTIVE_ASK_PREFIX = re.compile(r"(?:初步来看|看起来|可以确定|应该是|就是|会的|是的|属于).{2,40}[，,]")
+ASSESSMENT_AFTER = re.compile(r"(?:可能性大|考虑|提示|倾向)")
+ROLE_MAP = {"医生": "assistant", "患者": "user"}
 
 
-def normalize(text: str) -> str:
-    text = unicodedata.normalize("NFC", text)
-    text = text.replace("\u200b", "").replace("\ufeff", "")
-    text = re.sub(r"[ \t]+", " ", text)
-    return text.strip()
+def clean_text(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    value = unicodedata.normalize("NFC", value)
+    value = value.replace("\r\n", "\n").replace("\r", "\n").replace("\u200b", "")
+    value = re.sub(r"[ \t]+", " ", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value.strip()
 
 
-def patient_utterance(text: str) -> str:
-    if text.startswith(PROFILE_HEADER + "\n"):
-        _, separator, content = text[len(PROFILE_HEADER) + 1:].partition(
-            "\n\n" + PATIENT_HEADER + "\n")
-        if separator:
-            return content
-    return text
+def iter_strings(value: object):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, list):
+        for item in value:
+            yield from iter_strings(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from iter_strings(item)
 
 
-def action_from(message: dict) -> dict | None:
-    try:
-        target = json.loads(message["content"])
-    except (KeyError, TypeError, json.JSONDecodeError):
+def redact_case(case: dict) -> dict:
+    global EXPLICIT_NAME_CASES
+    names = set()
+    for text in iter_strings(case):
+        for match in NAME_INTRO.finditer(text):
+            name = match.group("name")
+            if name not in NAME_STOP and len(name) >= 2:
+                names.add(name)
+    if names:
+        EXPLICIT_NAME_CASES += 1
+
+    def visit(value):
+        if isinstance(value, str):
+            for name in sorted(names, key=lambda item: (-len(item), item)):
+                if name in value:
+                    value = value.replace(name, "[姓名已隐去]")
+                    PRIVACY_COUNTS["name"] += 1
+            for label, pattern, replacement in PRIVACY_RULES:
+                value, count = pattern.subn(replacement, value)
+                PRIVACY_COUNTS[label] += count
+            return value
+        if isinstance(value, list):
+            return [visit(item) for item in value]
+        if isinstance(value, dict):
+            return {key: visit(item) for key, item in value.items()}
+        return value
+
+    return visit(case)
+
+
+def informative_history(report: dict) -> bool:
+    if not all(clean_text(report.get(field)) for field in REPORT_FIELDS):
+        return False
+    history = clean_text(report["既往史"])
+    if UNKNOWN_HISTORY.search(history):
+        return False
+    if EMPTY_FINAL_FIELD.fullmatch(clean_text(report["诊断"])):
+        return False
+    if EMPTY_FINAL_FIELD.fullmatch(clean_text(report["建议"])):
+        return False
+    return True
+
+
+def choose_report(reports: object) -> dict | None:
+    if not isinstance(reports, list):
         return None
-    if (not isinstance(target, dict) or set(target) != ACTION_KEYS
-            or target.get("action") not in {"ASK", "FINAL"}
-            or not isinstance(target.get("message"), str)):
+    candidates = [r for r in reports if isinstance(r, dict) and informative_history(r)]
+    if not candidates:
         return None
-    return target
+    # Prefer the source report with the most patient-history detail.
+    return max(
+        candidates,
+        key=lambda report: sum(len(clean_text(report.get(key))) for key in PROFILE_FIELDS),
+    )
 
 
-def red_flag_present(patient_text: str) -> bool:
-    for match in RED_FLAG.finditer(patient_text):
-        preceding = patient_text[max(0, match.start() - 5):match.start()]
-        if not NEGATION_BEFORE.search(preceding):
-            return True
+def make_groups(case: dict) -> list[dict] | None:
+    groups: list[dict] = []
+    for turn in case.get("dialogue") or []:
+        if not isinstance(turn, dict):
+            return None
+        role = ROLE_MAP.get(turn.get("speaker"))
+        text = clean_text(turn.get("sentence"))
+        if role is None or not text:
+            return None
+        if groups and groups[-1]["role"] == role:
+            groups[-1]["content"] += "\n" + text
+        else:
+            groups.append({"role": role, "content": text})
+    if not groups:
+        return None
+    return groups
+
+
+def remove_terminal_closers(text: str) -> str:
+    lines = text.splitlines()
+    while len(lines) > 1 and TRAILING_CLOSER.fullmatch(lines[-1].strip()):
+        lines.pop()
+    return "\n".join(lines).strip()
+
+
+def diagnosis_matches(final_text: str, diagnosis: str) -> bool:
+    if ("?" in final_text or "？" in final_text
+            or re.search(r"(?:吗|呢)[。.!！?？\s]*$", final_text)):
+        return False
+    diagnosis_prefix = re.compile(
+        r"^(?:诊断为|考虑|初步诊断为?|可能为?|倾向于?|新生儿|婴儿|小儿|儿童|"
+        r"急性|慢性|病毒性|细菌性)+"
+    )
+    for label in re.split(r"[、，,；;及或/]", diagnosis):
+        label = diagnosis_prefix.sub("", label.strip())
+        label = re.sub(r"[\W_]+", "", label)
+        if len(label) < 2:
+            continue
+        for sentence in re.split(r"[。！？?!；;\n]", final_text):
+            sentence = re.sub(r"[\W_]+", "", sentence)
+            position = sentence.find(label)
+            if position < 0:
+                continue
+            before = sentence[max(0, position - 24):position]
+            after = sentence[position + len(label):position + len(label) + 10]
+            if (ASSESSMENT_BEFORE.search(before) or ASSESSMENT_AFTER.search(after)):
+                if not re.search(r"(?:如果|假如|若).{0,12}$", before):
+                    return True
     return False
 
 
-def screen(record: dict) -> tuple[dict | None, list[str]]:
-    reasons = []
-    messages = record.get("messages") if isinstance(record, dict) else None
-    if not isinstance(messages, list) or len(messages) < 2 or len(messages) % 2 != 0:
-        return None, ["invalid_structure"]
-    if any(not isinstance(m, dict) or set(m) != {"role", "content"}
-           or m["role"] != ("user" if index % 2 == 0 else "assistant")
-           or not isinstance(m["content"], str) or not m["content"].strip()
-           for index, m in enumerate(messages)):
-        return None, ["invalid_structure"]
-    target = action_from(messages[-1])
-    if target is None:
-        return None, ["invalid_target"]
-    doctor_text = normalize(target["message"])
-    if not doctor_text or len(doctor_text) > 350:
-        return None, ["target_length"]
-    patient_full = [normalize(m["content"]) for m in messages if m["role"] == "user"]
-    patient = [normalize(patient_utterance(text)) for text in patient_full]
-    history_doctor = [normalize(m["content"]) for m in messages[:-1]
-                      if m["role"] == "assistant"]
-    all_visible = patient_full + history_doctor + [doctor_text]
-    if any(DIRECT_PII.search(x) for x in all_visible):
-        reasons.append("direct_identifier_or_link")
-    if any(GARBLED.search(x) for x in all_visible):
-        reasons.append("garbled_text_or_markup")
-    if TARGET_TYPO.search(doctor_text):
-        reasons.append("obvious_target_typo_or_repeated_punctuation")
-    if any(RATING.search(x) or PROMOTION.search(x) for x in history_doctor + [doctor_text]):
-        reasons.append("rating_or_promotion")
-    if any(PLATFORM.search(x) for x in all_visible):
-        reasons.append("platform_template")
-    if any(MEDIA_DEPENDENCE.search(x) for x in all_visible):
-        reasons.append("unavailable_media")
-    if len(messages) > 13 or sum(len(x) for x in all_visible) > 1400:
-        reasons.append("overlong_context")
-    if any(len(x) > 500 for x in patient) or any(len(x) > 350 for x in history_doctor):
-        reasons.append("overlong_turn")
-    if len(HAN.findall(patient[-1])) < 2 or len(HAN.findall(doctor_text)) < 4:
-        reasons.append("low_information_turn")
-    if COURTESY_ONLY.fullmatch(patient[-1]) or ACK_ONLY.fullmatch(patient[-1]):
-        reasons.append("courtesy_only_last_patient_turn")
-    if (re.fullmatch(r".{0,8}(?:医生|大夫|主任|教授)[：:]?", patient[-1])
-            or (len(patient[-1]) < 35 and re.search(r"(?:晚上好|您好|你好).{0,12}(?:打扰|请问)", patient[-1]))):
-        reasons.append("greeting_only_last_patient_turn")
-    if red_flag_present("\n".join(patient)) and not (target["action"] == "FINAL" and URGENT_CARE.search(doctor_text)):
-        reasons.append("red_flag_without_urgent_final")
-    if target["action"] == "ASK":
-        if (len(doctor_text) < 6 or len(doctor_text) > 55
-                or doctor_text.count("？") + doctor_text.count("?") != 1
-                or not doctor_text.endswith(("？", "?"))):
-            reasons.append("ask_not_single_short_question")
-        if re.search(r"[。；;！!\n]", doctor_text) or doctor_text.count("吗") > 1:
-            reasons.append("ask_contains_multiple_sentences")
-        clauses = re.split(r"[,，]", doctor_text.rstrip("？?"))
-        if sum(bool(QUESTION_CUE.search(clause)) for clause in clauses) > 1:
-            reasons.append("ask_multiple_question_clauses")
-        if LOW_INFO_ASK.fullmatch(doctor_text):
-            reasons.append("generic_ask")
-        if GENERIC_SYMPTOM_ASK.search(doctor_text):
-            reasons.append("generic_symptom_ask")
-        if ASK_ADVICE.search(doctor_text):
-            reasons.append("ask_contains_advice_or_diagnosis")
-        if re.search(r"买.{0,12}吃|买.{0,12}用", doctor_text):
-            reasons.append("ask_implies_medication_purchase")
-        if re.search(r"出现多少岁|发病多少岁", doctor_text):
-            reasons.append("ask_garbled_question")
-        if RED_FLAG.search(doctor_text):
-            reasons.append("ask_continues_red_flag_inquiry")
-        if ASSERTIVE_ASK_PREFIX.search(doctor_text) or len(re.findall(r"你好|您好", doctor_text)) > 1:
-            reasons.append("ask_contains_assertion_or_repeated_greeting")
-        if DURATION_MENTION.search(patient[-1]) and GENERIC_DURATION_ASK.search(doctor_text):
-            reasons.append("ask_repeats_known_duration")
-        if AGE_MENTION.search(patient[-1]) and AGE_ASK.search(doctor_text):
-            reasons.append("ask_repeats_known_age")
-        if re.search(r"检查结果|结果.{0,5}(?:正常|没有|无|没|出来)", patient[-1]) and re.search(
-                r"检查结果如何|检查结果.{0,4}怎么样|结果怎么样|结果如何", doctor_text):
-            reasons.append("ask_repeats_known_test_result")
+def is_clean_text(text: str) -> str | None:
+    if not text:
+        return "empty_text"
+    if GARBLED.search(text) or REPEATED_PUNCTUATION.search(text):
+        return "garbled_or_corrupt_text"
+    if DIRECT_PII.search(text):
+        return "direct_identifier_or_link"
+    if MEDIA_DEPENDENCE.search(text):
+        return "unavailable_image_or_attachment"
+    return None
+
+
+def inspect_case(case: dict) -> tuple[dict | None, str]:
+    case = redact_case(case)
+    report = choose_report(case.get("report"))
+    if report is None:
+        return None, "missing_or_incomplete_medical_record"
+
+    groups = make_groups(case)
+    if groups is None:
+        return None, "invalid_dialogue"
+    full_text = "\n".join(group["content"] for group in groups)
+    if any(pattern.search(full_text) for pattern in NOISE_PATTERNS):
+        return None, "rating_request_or_turn_limit"
+    for text in [full_text, *(clean_text(report.get(k)) for k in PROFILE_FIELDS)]:
+        reason = is_clean_text(text)
+        if reason:
+            return None, reason
+
+    complete_rounds = sum(
+        group["role"] == "user"
+        and index + 1 < len(groups)
+        and groups[index + 1]["role"] == "assistant"
+        for index, group in enumerate(groups)
+    )
+    if complete_rounds < 3:
+        return None, "fewer_than_three_complete_rounds"
+    if len(groups) > 40 or sum(len(group["content"]) for group in groups) > 8000:
+        return None, "overlong_dialogue"
+    if any(len(group["content"]) > 2000 for group in groups):
+        return None, "overlong_turn"
+
+    observed_final = (
+        remove_terminal_closers(groups[-1]["content"])
+        if groups[-1]["role"] == "assistant"
+        else ""
+    )
+    diagnosis = clean_text(report.get("诊断"))
+    recommendation = clean_text(report.get("建议"))
+    use_observed_final = bool(
+        observed_final
+        and len(observed_final) >= 25
+        and len(observed_final) <= 1200
+        and diagnosis_matches(observed_final, diagnosis)
+        and ADVICE_CUE.search(observed_final)
+    )
+    if use_observed_final:
+        final_text = observed_final
+        final_origin = "observed_doctor_response"
+        history_groups = groups[:-1]
     else:
-        if (len(doctor_text) < 30 or len(doctor_text) > 180 or "?" in doctor_text
-                or "？" in doctor_text or doctor_text.endswith(("，", ",", "；", ";", "、", "：", ":"))):
-            reasons.append("final_too_short_or_question")
-        if FINAL_FALLBACK.search(doctor_text):
-            reasons.append("final_courtesy_or_closer")
-        if not FINAL_CONTENT.search(doctor_text):
-            reasons.append("final_no_actionable_content")
-        if not FINAL_ACTION.search(doctor_text) or not FINAL_CAUTION.search(doctor_text):
-            reasons.append("final_lacks_action_or_caution")
-        if not FINAL_NEXT_STEP.search(doctor_text):
-            reasons.append("final_lacks_observation_or_followup")
-        if (DIRECT_DRUG_ADVICE.search(doctor_text) or DIRECT_DRUG_VERB.search(doctor_text)
-                or ANY_MEDICATION_IN_FINAL.search(doctor_text)):
-            reasons.append("final_direct_drug_instruction")
-        if OVERCONFIDENT.search(doctor_text):
-            reasons.append("final_overconfident_claim")
-        if INSTITUTIONAL_REPLY.search(doctor_text):
-            reasons.append("final_institutional_reply")
-        if TREATMENT_CERTAINTY.search(doctor_text):
-            reasons.append("final_categorical_treatment_claim")
-        if PROCEDURE_DIRECTIVE.search(doctor_text):
-            reasons.append("final_direct_procedure_or_absolute_claim")
-        if UNPROFESSIONAL_REPLY.search(doctor_text):
-            reasons.append("final_unprofessional_tone_or_promotion")
-        if UNSUPPORTED_DIAGNOSIS.search(doctor_text):
-            reasons.append("final_categorical_diagnosis")
-        if re.search(r"(?:建议|治疗)[:：]\s*$", doctor_text):
-            reasons.append("final_truncated_recommendation")
-    if reasons:
-        return None, list(dict.fromkeys(reasons))
-    cleaned = {"messages": [{"role": m["role"], "content": normalize(m["content"])}
-                            for m in messages]}
-    cleaned["messages"][-1]["content"] = json.dumps(
-        {"action": target["action"], "message": doctor_text},
-        ensure_ascii=False, separators=(",", ":"))
-    return cleaned, []
+        final_text = f"诊断：{diagnosis}\n建议：{recommendation}"
+        final_origin = "structured_report_annotation"
+        # Replace an incomplete final doctor utterance with the report-derived
+        # clinical close, rather than placing two assistant turns back to back.
+        history_groups = groups[:-1] if groups[-1]["role"] == "assistant" else groups
+    if len(final_text) < 25 or len(final_text) > 1200:
+        return None, "final_answer_length"
+    if not diagnosis_matches(final_text, diagnosis):
+        return None, "final_answer_without_diagnosis"
+    if not ADVICE_CUE.search(final_text):
+        return None, "final_answer_without_advice"
 
+    target_record = f"{diagnosis}\n{recommendation}"
+    for text in (diagnosis, recommendation):
+        reason = is_clean_text(text)
+        if reason:
+            return None, reason
+    if any(pattern.search(target_record) for pattern in NOISE_PATTERNS):
+        return None, "rating_request_or_turn_limit"
 
-def digest(record: dict) -> str:
-    return hashlib.sha256(json.dumps(record, ensure_ascii=False,
-                                     sort_keys=True).encode("utf-8")).hexdigest()
+    profile = "\n".join(
+        f"{field}：{clean_text(report[field])}" for field in PROFILE_FIELDS
+    )
+    profile = "患者就诊病历（本次诊断和建议不放入输入）：\n" + profile
+    visible_chars = len(profile) + len(final_text) + sum(
+        len(group["content"]) for group in history_groups
+    )
+    if visible_chars > 3600:
+        return None, "overlong_case_for_4096_context"
 
-
-def split_for_case(case_id: str) -> str:
-    rank = int.from_bytes(hashlib.sha256(
-        ("heapo-sft-v1:" + case_id).encode("utf-8")).digest()[:8], "big")
-    return "dev" if rank / (1 << 64) < 0.1 else "train"
-
-
-def source_candidate(row: dict) -> tuple[dict | None, str | None]:
-    metadata = row["metadata"]
-    quality = metadata["quality"]
-    if metadata["synthetic"]:
-        return None, "synthetic_row"
-    if row["start_type"] != "continuation" or metadata["start_reason"] != "labeled":
-        return None, "no_aligned_logged_action"
-    if quality["target_passed"] is not True or quality["target_issues"]:
-        return None, "upstream_target_flagged"
-    if metadata["dialogue_truncated"]:
-        return None, "truncated_source_dialogue"
-    if quality["missing_image"]:
-        return None, "missing_image"
-    if quality["history_issues"]:
-        return None, "upstream_history_flagged"
-    reference = row["environment"]["reference"]
-    action, text = reference["logged_action"], reference["logged_response"]
-    if action not in {"ASK", "FINAL"} or not isinstance(text, str) or not text.strip():
-        return None, "missing_aligned_logged_response"
-    source_messages = row["messages"]
-    if not source_messages or source_messages[0].get("role") != "system":
-        return None, "invalid_source_messages"
-    system_text = source_messages[0].get("content", "")
-    _, marker, raw_profile = system_text.partition(SYSTEM_PROFILE_MARKER)
-    visible_messages = [dict(message) for message in source_messages[1:]]
-    if not visible_messages or visible_messages[0].get("role") != "user":
-        return None, "invalid_source_messages"
-    if marker:
-        try:
-            profile = json.loads(raw_profile)
-        except json.JSONDecodeError:
-            return None, "invalid_visible_profile"
-        if (not isinstance(profile, dict)
-                or set(profile) != {"age_years", "sex", "history_mentions",
-                                    "medication_mentions", "allergy_mentions"}):
-            return None, "invalid_visible_profile"
-        has_profile = (profile["age_years"] is not None or profile["sex"] is not None
-                       or any(profile[key] for key in (
-                           "history_mentions", "medication_mentions", "allergy_mentions")))
-        if has_profile:
-            profile_json = json.dumps(profile, ensure_ascii=False, separators=(",", ":"))
-            visible_messages[0]["content"] = (
-                f"{PROFILE_HEADER}\n{profile_json}\n\n{PATIENT_HEADER}\n"
-                f"{visible_messages[0]['content']}")
-    target = json.dumps({"action": action, "message": text}, ensure_ascii=False,
-                        separators=(",", ":"))
-    return {"messages": [*visible_messages, {"role": "assistant", "content": target}]}, None
-
-
-def reservoir_add(pool: list, seen_count: int, item: tuple, rng: random.Random) -> None:
-    if len(pool) < 20:
-        pool.append(item)
+    messages: list[dict[str, str]] = []
+    start = 0
+    if groups[0]["role"] == "user":
+        messages.append({
+            "role": "user",
+            "content": profile + "\n\n患者发言：\n" + groups[0]["content"],
+        })
+        start = 1
     else:
-        position = rng.randrange(seen_count)
-        if position < 20:
-            pool[position] = item
+        messages.append({"role": "user", "content": profile})
 
+    for group in history_groups[start:]:
+        messages.append({"role": group["role"], "content": group["content"]})
+    if not messages or messages[-1]["role"] != "user":
+        return None, "invalid_sft_message_order"
+    target = json.dumps(
+        {"action": "FINAL", "message": final_text},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    messages.append({"role": "assistant", "content": target})
 
-def run(input_parquet: Path, output_dir: Path, audit_dir: Path, seed: int = 20260929) -> dict:
-    if not input_parquet.is_file():
-        raise FileNotFoundError(input_parquet)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    audit_dir.mkdir(parents=True, exist_ok=True)
-    counts = Counter()
-    reasons = Counter()
-    randomizer = random.Random(seed)
-    seen = set()
-    accepted_for_review = {"ASK": [], "FINAL": []}
-    rejected_for_review = []
-    cases_by_split = {"train": set(), "dev": set()}
-    paths = {split: output_dir / f"{split}.openai.jsonl" for split in ("train", "dev")}
-    with (paths["train"].open("w", encoding="utf-8", newline="\n") as train_out,
-          paths["dev"].open("w", encoding="utf-8", newline="\n") as dev_out):
-        writers = {"train": train_out, "dev": dev_out}
-        columns = ["case_id", "start_type", "messages", "environment", "metadata"]
-        for batch in pq.ParquetFile(input_parquet).iter_batches(batch_size=1024, columns=columns):
-            for row in batch.to_pylist():
-                counts["source_rows"] += 1
-                record, preliminary_reason = source_candidate(row)
-                if preliminary_reason:
-                    counts["excluded_before_text_rules"] += 1
-                    reasons[preliminary_reason] += 1
-                    continue
-                counts["aligned_candidates"] += 1
-                split = split_for_case(row["case_id"])
-                clean, flags = screen(record)
-                if clean is not None:
-                    key = digest(clean)
-                    if key in seen:
-                        flags = ["duplicate_conversation"]
-                    else:
-                        seen.add(key)
-                if flags:
-                    counts[f"{split}_rejected"] += 1
-                    reasons.update(flags)
-                    item = (split, counts["source_rows"], ";".join(flags), record)
-                    reservoir_add(rejected_for_review,
-                                  counts["train_rejected"] + counts["dev_rejected"],
-                                  item, randomizer)
-                    continue
-                writers[split].write(json.dumps(clean, ensure_ascii=False) + "\n")
-                cases_by_split[split].add(row["case_id"])
-                counts[f"{split}_accepted"] += 1
-                action = action_from(clean["messages"][-1])["action"]
-                counts[f"{split}_{action.lower()}"] += 1
-                item = (split, counts["source_rows"], "accepted", clean)
-                reservoir_add(accepted_for_review[action],
-                              counts[f"train_{action.lower()}"] + counts[f"dev_{action.lower()}"],
-                              item, randomizer)
-    if cases_by_split["train"] & cases_by_split["dev"]:
-        raise ValueError("SFT train/dev case overlap")
-    review_groups = {
-        "accepted_review20.csv": [
-            *randomizer.sample(accepted_for_review["ASK"], min(10, len(accepted_for_review["ASK"]))),
-            *randomizer.sample(accepted_for_review["FINAL"], min(10, len(accepted_for_review["FINAL"]))),
-        ],
-        "rejected_review20.csv": randomizer.sample(rejected_for_review,
-                                                   min(20, len(rejected_for_review))),
+    record = {
+        "messages": messages,
+        "profile": profile,
+        "dialogue": history_groups + [{"role": "assistant", "content": final_text}],
+        "final_origin": final_origin,
+        "fingerprint": hashlib.sha256(
+            json.dumps(messages, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
     }
-    for filename, sample in review_groups.items():
-        with (audit_dir / filename).open("w", encoding="utf-8-sig", newline="") as stream:
-            writer = csv.writer(stream)
-            writer.writerow(("split", "source_line", "result", "last_patient", "target"))
-            for split, line_number, label, record in sample:
-                messages = record["messages"]
-                target = action_from(messages[-1])
-                writer.writerow((split, line_number, label,
-                                 next((m["content"] for m in reversed(messages[:-1])
-                                       if m["role"] == "user"), "")[:500],
-                                 (target["message"] if target else messages[-1]["content"])[:500]))
-    report = {"rule_version": RULE_VERSION,
-              "source_sha256": hashlib.sha256(input_parquet.read_bytes()).hexdigest(),
-              "counts": dict(counts), "rejection_reasons": dict(reasons),
-              "unique_cases": {split: len(cases) for split, cases in cases_by_split.items()},
-              "limitations": "Deterministic filtering cannot certify clinical correctness; review accepted examples before training."}
-    (audit_dir / "report.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return report
+    return record, "accepted"
 
 
-def main() -> None:
+def load_split(archive: ZipFile, member: str):
+    data = json.loads(archive.read(member).decode("utf-8-sig"))
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected a JSON object in {member}")
+    return data
+
+
+def atomic_jsonl(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".partial")
+    with tmp.open("w", encoding="utf-8", newline="\n") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+    tmp.replace(path)
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--audit-dir", type=Path, default=DEFAULT_AUDIT)
+    parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--audit", type=Path, default=DEFAULT_AUDIT)
+    parser.add_argument("--spotcheck-size", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=20260929)
     args = parser.parse_args()
-    print(json.dumps(run(args.input, args.output_dir, args.audit_dir), ensure_ascii=False))
+
+    if not args.source.exists():
+        raise FileNotFoundError(
+            f"IMCS-V2-MRG source archive not found: {args.source}. "
+            "Download the official source archive locally and rerun."
+        )
+
+    accepted: dict[str, list[dict]] = {"train": [], "dev": []}
+    rejected: dict[str, Counter] = {"train": Counter(), "dev": Counter()}
+    members = {
+        "train": "IMCS-V2-MRG/IMCS-V2_train.json",
+        "dev": "IMCS-V2-MRG/IMCS-V2_dev.json",
+    }
+    with ZipFile(args.source) as archive:
+        for split, member in members.items():
+            for _, case in load_split(archive, member).items():
+                candidate, reason = inspect_case(case)
+                if candidate is None:
+                    rejected[split][reason] += 1
+                else:
+                    candidate["split"] = split
+                    accepted[split].append(candidate)
+
+    train_fingerprints = {row["fingerprint"] for row in accepted["train"]}
+    accepted["dev"] = [
+        row for row in accepted["dev"] if row["fingerprint"] not in train_fingerprints
+    ]
+    accepted["train"].sort(key=lambda row: row["fingerprint"])
+    accepted["dev"].sort(key=lambda row: row["fingerprint"])
+
+    residual_privacy = Counter()
+    for split_rows in accepted.values():
+        for row in split_rows:
+            for text in iter_strings(row["messages"]):
+                if NAME_INTRO.search(text):
+                    residual_privacy["explicit_name"] += 1
+                if DIRECT_PII.search(text):
+                    residual_privacy["direct_identifier_or_link"] += 1
+                for label, pattern, _ in PRIVACY_RULES:
+                    if pattern.search(text):
+                        residual_privacy[label] += 1
+    if residual_privacy:
+        raise ValueError(f"Residual direct-identifier patterns found: {dict(residual_privacy)}")
+
+    for split in ("train", "dev"):
+        atomic_jsonl(args.output / f"{split}.openai.jsonl", [
+            {"messages": row["messages"]} for row in accepted[split]
+        ])
+
+    reason_counts = {
+        split: dict(sorted(counts.items())) for split, counts in rejected.items()
+    }
+    report = {
+        "source": "IMCS-V2-MRG",
+        "method": "rules_only_no_llm",
+        "source_record_counts": {
+            split: len(accepted[split]) + sum(rejected[split].values())
+            for split in accepted
+        },
+        "criteria": {
+            "complete_six_section_source_report": True,
+            "past_history_must_not_be_unknown": True,
+            "at_least_three_patient_doctor_rounds": True,
+            "conversation_must_end_with_doctor": True,
+            "final_answer_must_include_diagnosis_and_advice": True,
+            "incomplete_observed_final_replaced_by_source_report_annotation": True,
+            "reject_turn_limit_rating_noise_pii_and_missing_media": True,
+            "diagnosis_and_recommendation_excluded_from_visible_profile": True,
+            "test_split_used": False,
+        },
+        "accepted": {split: len(rows) for split, rows in accepted.items()},
+        "final_answer_origins": {
+            split: dict(Counter(row["final_origin"] for row in rows))
+            for split, rows in accepted.items()
+        },
+        "privacy": {
+            "profile": "rule_based_direct_identifier_scrub_v1",
+            "explicit_name_cases_scrubbed": EXPLICIT_NAME_CASES,
+            "redactions_by_type": dict(sorted(PRIVACY_COUNTS.items())),
+            "residual_direct_identifier_patterns": {},
+        },
+        "rejected": reason_counts,
+    }
+    args.audit.mkdir(parents=True, exist_ok=True)
+    (args.audit / "quality_report.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+
+    all_rows = [
+        (split, row)
+        for split in ("train", "dev")
+        for row in accepted[split]
+    ]
+    sample_n = min(max(args.spotcheck_size, 0), len(all_rows))
+    sampled = random.Random(args.seed).sample(all_rows, sample_n)
+    spotcheck_path = args.audit / f"spotcheck{sample_n}.csv"
+    with spotcheck_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=(
+                "sample_id", "split", "final_answer_origin", "patient_record",
+                "dialogue", "final_answer",
+            ),
+        )
+        writer.writeheader()
+        for index, (split, row) in enumerate(sampled, 1):
+            dialogue = []
+            for message in row["dialogue"]:
+                speaker = "患者" if message["role"] == "user" else "医生"
+                dialogue.append(f"{speaker}：{message['content']}")
+            target = json.loads(row["messages"][-1]["content"])["message"]
+            writer.writerow({
+                "sample_id": f"review_{index:02d}",
+                "split": split,
+                "final_answer_origin": row["final_origin"],
+                "patient_record": row["profile"],
+                "dialogue": "\n".join(dialogue),
+                "final_answer": target,
+            })
+
+    print(
+        f"Complete-case SFT data ready: train={len(accepted['train'])}, "
+        f"dev={len(accepted['dev'])}; no LLM calls."
+    )
+    print(f"Files: {args.output / 'train.openai.jsonl'}")
+    print(f"       {args.output / 'dev.openai.jsonl'}")
+    print(f"Review: {spotcheck_path}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

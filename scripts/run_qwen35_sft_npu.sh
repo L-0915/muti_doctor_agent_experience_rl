@@ -59,7 +59,7 @@ COMMON_ARGS=(
   --per_device_eval_batch_size 1
   --gradient_accumulation_steps 2
   --learning_rate 5e-5
-  --max_length 2048
+  --max_length 4096
   --truncation_strategy delete
   --num_train_epochs 1
   --dataset_num_proc 4
