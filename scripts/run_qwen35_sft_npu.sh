@@ -10,7 +10,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATA_DIR="${DATA_DIR:-$PROJECT_DIR/data/processed/mindspeed_sft}"
+DATA_DIR="${DATA_DIR:-$PROJECT_DIR/data/processed/sft_clean}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.5-9B}"
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/output/qwen35_9b_sft}"
 TRAIN_FILE="$DATA_DIR/train.openai.jsonl"
@@ -27,7 +27,7 @@ if ! command -v swift >/dev/null 2>&1; then
   exit 1
 fi
 
-# A small case-level SFT set does not need all 128 available NPUs.
+# Cold-start SFT can start on 8 of the available NPUs.
 export NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
