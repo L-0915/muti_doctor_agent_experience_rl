@@ -1,0 +1,409 @@
+% !TeX program = xelatex
+% BG-GRPO 方法与实验设计 v4 —— LaTeX 原版
+% 编译：xelatex BG-GRPO-method-v4.tex（需 TeX Live / CTeX，含 ctex 宏包）
+% 相对 v3 的变更：全索引化（病例 i / 组内轨迹 j / 轮次 t）、熵与 VoI 形式化、
+% 轮级优势与目标的组级期望显式化、记号表、基线表、消融表、算法伪代码。
+\documentclass[11pt,a4paper]{ctexart}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{hyperref}
+
+\newtheorem{proposition}{命题}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\1}[1]{\mathbb{1}\!\left[#1\right]}
+\newcommand{\Fhat}{\hat{F}}
+\newcommand{\Dcal}{\mathcal{D}}
+\newcommand{\Ocal}{\mathcal{O}}
+\newcommand{\Scal}{\mathcal{S}}
+\newcommand{\Gcal}{\mathcal{G}}
+\newcommand{\Bcal}{\mathcal{B}}
+\newcommand{\Bupd}{\mathsf{B}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\IG}{\mathrm{IG}}
+\newcommand{\VoI}{\mathrm{VoI}}
+
+\title{信念引导的组相对策略优化（BG-GRPO）：方法与实验设计\\ \large v4（LaTeX 版，2026-10-28）}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{修订说明（v4）}
+相对 v3 的变更：（一）记号全索引化：病例 $i$、组内轨迹 $j$、轮次 $t$，信念记 $b_t^{(i,j)}$，单轨迹语境省略上标；（二）熵、VoI、轮级簇基线、组级训练目标全部给出显式形式（式 \eqref{eq:entropy}、\eqref{eq:voi}、\eqref{eq:advantage}、\eqref{eq:objective}）；（三）终局成本 $C(\tau)$ 展开为轮数与 token 两项（式 \eqref{eq:utility}）；（四）组大小公式附批量预算约束（式 \eqref{eq:groupsize}）；（五）新增记号表、基线表、消融表与算法伪代码；（六）方法学内容与 v3 一致（命题 1 为回报分解与有界终局残余，命题 2 终止性，命题 3 方差结构）。
+
+\section{创新点概述}
+本文方法部分围绕一条主线：问诊的核心困难——逐轮信用分配、终止控制与探索预算分配——统一放在对患者隐状态的信念空间上度量；策略优化的机器仍是 GRPO，每轮的奖励、终止与预算都由信念导出。核心贡献是信息充分性门控的终止控制：以归一化充分度把问诊分为三区，信息量达标即强制结案，信息量不足时结案不兑现、触发患者模拟器反质询并披露医生漏问的关键事实，阈值由 86{,}517 段真实问诊的结案充分度分布标定——终止由信息量而非固定轮数决定。理论支柱是混合信念势的逐轮过程奖励：熵势与效用势的凸组合，附可离线核算的事实级自信息作为模型外可验证分量；本文证明该整形对优化目标的全部净效应集中于一个有界的终局残余项（命题 \ref{prop:decomp}）——结案的剩余不确定性惩罚，其幅度由两个系数显式封顶。效率贡献是信念熵驱动的组构造：把模拟器预算自适应分配给方向不明的病例与轮次。
+
+\section{记号表}
+\begin{table}[h]\centering
+\begin{tabular}{ll}
+\toprule
+符号 & 含义 \\
+\midrule
+$i \in [N]$ & 病例索引；$j \in [n_i]$ 组内轨迹索引；$t \in \{0,\dots,T_i\}$ 轮次 \\
+$s_i=(F_i,c_i)$ & 隐状态：病例事实集 $F_i$ 与参考结论 $c_i$（仅模拟器可见） \\
+$a_t=(u_t,m_t)$ & 分层动作：$u_t\in\{\mathrm{WEN},\mathrm{TALK},\mathrm{DIG}\}$，$m_t$ 为文本 \\
+$h_t^{(i,j)}$ & 截至第 $t$ 轮的对话历史（动作与观测的序列拼接） \\
+$\Fhat=\{f_1,\dots,f_K\}$ & 病例级关键事实清单；$\Dcal$ 鉴别诊断空间，$D=|\Dcal|$ \\
+$b_t^{(i,j)}\in\Delta^{K+D-1}$ & 信念：$\Dcal(\Fhat\cup\Dcal)$ 上的分布 \\
+$C_t^{(i,j)}\subseteq\Fhat$ & 截至第 $t$ 轮已被患者证实的事实集合 \\
+$E_i\subseteq\Fhat$ & 病例 $i$ 的必问事实集合，$\omega_k$ 为事实 $k$ 的关键度 \\
+$\pi_\theta,\ \pi_0$ & 策略与冷启动先验（SFT 得到） \\
+$P_{\hat\theta},\ P_\phi$ & 冻结信念估计器、患者模拟器 \\
+$\Psi,\ H,\ \Phi_U$ & 混合信念势、信念熵、结案期望效用 \\
+$\alpha,\beta,\lambda$ & 势强度、信息—效用插值系数、事实项权重 \\
+$\tau^-,\tau^+,\tau_H$ & 充分度下/上门限、分支熵门限 \\
+$n_i,\ \bar n,\ n_{\min},n_{\max}$ & 病例 $i$ 的组大小、批量平均组大小、组大小上下限 \\
+$g(\cdot),\ \mu_c,\ \Scal_c$ & 信念聚类函数、簇 $c$ 基线、簇内样本集 \\
+$\varepsilon,\ \varepsilon_{\mathrm{clip}},\ \eta_{\mathrm{KL}}$ & 自信息截断下界、PPO/GRPO 裁剪半宽、KL 自适应系数 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{问题形式化：问诊 POMDP 与信念空间}
+一次问诊建模为有限期部分可观测马尔可夫决策过程
+$\mathcal{M}=\langle\Scal,\mathcal{A},\Ocal,T,U,\gamma\rangle$，
+$\gamma=1$（有限期，无折扣）。隐状态 $s_i=(F_i,c_i)$ 对策略不可见，仅由患者模拟器持有；动作分层 $a_t=(u_t,m_t)$；观测 $o_{t+1}\sim P_\phi(\cdot\mid s_i,a_t)$，对 WEN 只回答有病例来源的事实，未覆盖属性回答``未提供''，并可向医生反问；转移 $T$ 不显式学习，由模拟器实现。轮次预算 $B_i=\min(20,\,n_i^{\mathrm{real}}+2)$ 且下限为 3（$n_i^{\mathrm{real}}$ 为真实问诊的医生轮数）。
+
+终局效用定义为
+\begin{equation}\label{eq:utility}
+U_i(\tau)=w_o\cdot r_{\mathrm{out}}(\hat c_i,c_i)
+-w_c\cdot\bigl(\beta_T\,T_i(\tau)+\beta_N\,N_{\mathrm{tok}}(\tau)\bigr),
+\end{equation}
+其中 $r_{\mathrm{out}}\in[0,1]$ 为冻结评审模型对策略结论 $\hat c_i$ 与真实医生最后实质结论 $c_i$ 临床一致性的评分，$T_i(\tau)$ 为医生轮数，$N_{\mathrm{tok}}(\tau)$ 为生成 token 数；信息获取不进入 $U$，完全由逐轮过程奖励承载（第 \ref{sec:reward} 节的职责划分），$r_{\mathrm{info}}$（关键事实获取率）保留为评测端点。
+
+急症通道：冻结的多标签急症识别器（规则优先、LLM 兜底）逐轮作用于患者最新发言，命中即屏蔽 $\mathrm{DIG}$、插入转诊模板并对延误施加硬惩罚 $-M$（移出组内归一化）；其优先级高于信息充分性门控，防止充分度达标掩盖急症信号。识别器在冷启动前标定召回率下限并冻结，不参与训练。
+
+状态不可直接观测决定了最优值函数只能定义在信念上：$V^\ast(b)=\max_\pi \E[U\mid b]$。本文不求解信念空间的显式最优控制，而是把信念作为奖励与信用的度量空间：策略优化的机器仍是 GRPO，但每轮的奖励与基线都由信念导出；优化目标为逐轮回报之和，按命题 \ref{prop:decomp} 等价于
+\begin{equation}\label{eq:objective-j}
+J(\pi)=\E_{\tau\sim\pi}\Bigl[U_i(\tau)+R_T(\tau)+\lambda\textstyle\sum_{t} r_t^{\mathrm{f}}\Bigr],
+\end{equation}
+其中 $\Psi(b_0)$ 为与策略无关的常数项，三项分别对应终局效用、结案纪律残余与事实项。
+
+\section{临床事实信念估计器}
+信念估计器为冻结的语言模型，输出 $\Fhat\cup\Dcal$ 上 $K+D$ 个原子的离散分布：
+\begin{equation}\label{eq:estimator}
+b_t^{(i,j)}=P_{\hat\theta}\bigl(\Fhat\cup\Dcal \mid h_t^{(i,j)}\bigr)\in\Delta^{K+D-1},
+\end{equation}
+仅前向、不参与训练。为后续公式简洁，定义\textbf{信念更新算子}
+\begin{equation}\label{eq:belief-update}
+\Bupd(h,a,o):=P_{\hat\theta}\bigl(\cdot\mid h\oplus a\oplus o\bigr),
+\end{equation}
+$\oplus$ 表示历史拼接，则 $b_{t+1}^{(i,j)}=\Bupd\bigl(h_t^{(i,j)},a_t^{(i,j)},o_{t+1}^{(i,j)}\bigr)$。选择冻结估计器而非在线 critic 的理由有三：其一，监督信号密度——86{,}517 段真实问诊的逐轮事实状态提供离线监督，而 critic 只能从稀疏终局效用自举；其二，稳定性——冻结意味着没有随策略更新漂移的移动目标，长程优势估计不携带 critic 滞后偏差；其三，可审计——输出是离散分布，可在留出集上以期望校准误差（ECE）度量，误差可归因到具体事实。估计器粒度由关键事实清单控制，IMCS-21 的诊断标签用于交叉验证清单的必要性。$P_{\hat\theta}$ 只用于训练期奖励、门控与预算分配；评测期信息侧指标另以留出强估计器 $P_{\hat\theta'}$ 复算，避免训练与评测共用同一仪器（见评测协议）。
+
+\section{奖励设计：以信息增益为主过程信号（理论支柱）}\label{sec:reward}
+
+\subsection{混合信念势与过程奖励}
+信念熵与结案期望效用定义为
+\begin{equation}\label{eq:entropy}
+H(b)=-\sum_{z\in\Fhat\cup\Dcal} b(z)\log_2 b(z),
+\qquad
+\Phi_U(b)=\sum_{z\in\Fhat\cup\Dcal} b(z)\,U_c(z),
+\end{equation}
+其中 $U_c(z)\in[0,1]$ 为直接以 $z$ 为结论的归一化效用。混合信念势及其逐轮差分（过程奖励）为
+\begin{equation}\label{eq:potential}
+\Psi(b)=\alpha\bigl[(1-\beta)\bigl(-H(b)\bigr)+\beta\,\Phi_U(b)\bigr],
+\end{equation}
+\begin{equation}\label{eq:process}
+r_t^{\mathrm{P}}
+=\Psi\bigl(b_{t+1}^{(i,j)}\bigr)-\Psi\bigl(b_t^{(i,j)}\bigr)
+=\alpha\bigl[(1-\beta)\,\IG_t^{(i,j)}+\beta\,\Delta\Phi_t^{(i,j)}\bigr],
+\end{equation}
+两个分量分别是信息增益与效用增益：
+\begin{equation}\label{eq:ig}
+\IG_t^{(i,j)}=H\bigl(b_t^{(i,j)}\bigr)-H\bigl(b_{t+1}^{(i,j)}\bigr),
+\qquad
+\Delta\Phi_t^{(i,j)}=\Phi_U\bigl(b_{t+1}^{(i,j)}\bigr)-\Phi_U\bigl(b_t^{(i,j)}\bigr).
+\end{equation}
+$\beta=1$ 时奖励``信念向高效用区移动''（功利口径），$\beta=0$ 时奖励``不确定性下降''（纯信息口径），任一取值都保持式 \eqref{eq:process} 的势函数差分形式。行动前的期望价值（信息价值）定义为在模拟器观测模型下对势增量的期望：
+\begin{equation}\label{eq:voi}
+\VoI(a\mid h_t^{(i,j)})
+=\E_{o\sim P_\phi(\cdot\mid s_i,a)}
+\Bigl[\Psi\bigl(\Bupd(h_t^{(i,j)},a,o)\bigr)-\Psi\bigl(b_t^{(i,j)}\bigr)\Bigr],
+\end{equation}
+当 $\alpha=1,\beta=0$ 时它退化为隐状态原子 $Z$ 与下一观测的互信息 $\VoI=I(Z;O_{t+1}\mid h_t,a)$，即贝叶斯实验设计的经典期望信息增益。$\VoI$ 度量``这个问题值多少信息''，用于探索与分支的预算分配（第 \ref{sec:group} 节），不直接进奖励。
+
+\subsection{事实级自信息：可验证的过程分量}
+式 \eqref{eq:process} 由信念估计器给出，属于模型内信号；与之互补，本文为每条新证实的关键事实定义模型外的可验证计分：本轮被患者证实的事实 $f_k$ 按其披露前的信念概率计自信息
+\begin{equation}\label{eq:fact}
+r_t^{\mathrm{f}}
+=\lambda\!\!\sum_{k\in C_t^{(i,j)}\setminus C_{t-1}^{(i,j)}}
+\log_2\frac{1}{\max\bigl(b_t^{(i,j)}(k),\,\varepsilon\bigr)},
+\qquad
+\varepsilon=\frac{1}{2(K+D)},
+\end{equation}
+其中 $C_t^{(i,j)}$ 为截至第 $t$ 轮已证实的事实集合，$\varepsilon$ 为截断下界。直觉：模型原以为越不可能的事实被披露，携带的信息量越大；已经确信的事实再次确认几乎不得分。该项不依赖任何评分模型，可在数据侧离线核算。
+
+\subsection{逐轮奖励与总回报}
+完整逐轮奖励为过程项、事实项与终局项之和
+\begin{equation}\label{eq:turn-reward}
+\tilde r_t^{(i,j)}
+=r_t^{\mathrm{P}}+r_t^{\mathrm{f}}
++\1{u_t^{(i,j)}=\mathrm{DIG}}\cdot U_i\bigl(\tau^{(i,j)}\bigr),
+\end{equation}
+急症集合上的延误施加硬惩罚 $-M$ 并屏蔽正优势，不参与组内归一化。
+
+\begin{proposition}[回报分解与有界终局残余]\label{prop:decomp}
+设 $U_c(z)\in[0,1]$ 归一化，$H$ 以比特计。对任意轨迹 $\tau^{(i,j)}$ 与逐轮奖励 \eqref{eq:turn-reward}，
+\begin{equation}\label{eq:decomp}
+\sum_{t=0}^{T_i}\tilde r_t^{(i,j)}
+=U_i\bigl(\tau^{(i,j)}\bigr)+R_T\bigl(\tau^{(i,j)}\bigr)
++\lambda\sum_{t=0}^{T_i} r_t^{\mathrm{f}}-\Psi\bigl(b_0^{(i,j)}\bigr),
+\end{equation}
+其中终局残余
+\begin{equation}\label{eq:residual}
+R_T\triangleq\Psi(b_T)-\Psi(b_0)
+=\alpha\Bigl[(1-\beta)\bigl(H(b_0)-H(b_T)\bigr)
++\beta\bigl(\Phi_U(b_T)-\Phi_U(b_0)\bigr)\Bigr].
+\end{equation}
+当 $H(b_T)\le H(b_0)$（信念单调细化的正常情形）时，
+\begin{equation}\label{eq:bound}
+-\alpha\beta\;\le\;R_T\;\le\;\alpha\bigl[(1-\beta)\,H(b_0)+\beta\bigr];
+\end{equation}
+无条件的一般下界为 $R_T\ge-\alpha\bigl[(1-\beta)\log_2(K+D)+\beta\bigr]$。
+\end{proposition}
+
+\begin{proof}[证明梗概]
+对式 \eqref{eq:process} 沿轨迹裂项求和即得 \eqref{eq:decomp}；在 $H(b_T)\le H(b_0)$ 下由 $H(b)\ge0$ 与 $\Phi_U(b)\in[0,1]$ 得 \eqref{eq:bound}；一般情形以 $H(b)\le\log_2(K+D)$ 代替 $H(b_0)$ 得宽松下界。
+\end{proof}
+
+\textbf{与势函数整形定理的关系.}\
+Ng 等 \cite{ng1999policy} 的策略不变性要求无限期折扣（$\gamma<1$）或终局吸收态势为常数；本文是有限期、$\gamma=1$ 的 episodic 任务，$R_T$ 随策略变化，整形因此构成对目标的有意修改而非中性加速。Wiewiora \cite{wiewiora2003potential} 证明势整形与值初始化等价，$R_T$ 正是初始化偏置在终局的体现。若令吸收态势为常数即可恢复严格不变性，但那会同时移除本文想要的效果；本文保留 $R_T$，其语义即``结案纪律''：熵分量 $\alpha(1-\beta)(H(b_0)-H(b_T))$ 惩罚在高剩余不确定性下结案，效用分量 $\alpha\beta(\Phi_U(b_T)-\Phi_U(b_0))$ 奖励把信念推向高效用结论区。$\alpha=0$ 退化为无整形基线；$\alpha$ 的取值由消融标定，使 $R_T$ 的量级与 $U$ 可比而不喧宾夺主。
+
+$R_T$ 给出两个设计结论。其一，提前结案的惩罚自动成立且自动有界：以 $\beta=0$ 为例，策略在信念熵仍高时结案直接损失 $\alpha\,(H(b_0)-H(b_T))$，不需要额外的规则惩罚，且损失不超过 $\alpha H(b_0)$，残余充分小时终局效用的排序不被翻转。其二，三类动作分层自动成立：WEN 的信用来自 $\IG$、$\Delta\Phi$ 与 $r^{\mathrm{f}}$；DIG 的信用来自 $U$ 与 $R_T$；TALK 通常不改变信念，$\IG\approx\Delta\Phi\approx0$、$r^{\mathrm{f}}=0$，自然不计信用，其表达由对冷启动先验的 KL 约束维持；安抚性 TALK 若促成患者后续披露，其价值通过后续轮的 $\IG_t$ 延迟兑现。
+
+\subsection{信息增益奖励的博弈面与对策}
+逐项说明三个可预见的策略性漏洞及对策。其一，好奇心陷阱：与结论无关的问题同样降低熵。对策有三——事实项 $r^{\mathrm{f}}$ 只对清单内事实计分（清单由病例结论反推，天然相关）；$\beta>0$ 把过程信号向效用对齐；报告``无关信息获取率''（清单外披露的信息量占比）作为诊断指标。其二，诱导性提问：以暗示性措辞套取患者附和。对策：评审模型对提问质量设有扣分项，且模拟器对无病例来源的提问统一回答``未提供''，诱导不产生信念更新。其三，冗长问诊：多次小额信息累积。对策：成本项 $w_c(\beta_T T+\beta_N N_{\mathrm{tok}})$ 与轮次预算 $B_i$ 从总量上封顶，且边际信息递减（熵有下界）使拖延无利可图。
+
+\section{信息充分性门控的问诊终止控制（核心贡献）}\label{sec:gate}
+
+\subsection{充分度与三区门控}
+信息增益不止用于奖励，也用于决定问诊何时应该结束。定义归一化的信息充分度
+\begin{equation}\label{eq:suff}
+S_t^{(i,j)}
+=\frac{H\bigl(b_0^{(i,j)}\bigr)-H\bigl(b_t^{(i,j)}\bigr)}{H\bigl(b_0^{(i,j)}\bigr)}
+=1-\frac{H\bigl(b_t^{(i,j)}\bigr)}{H\bigl(b_0^{(i,j)}\bigr)}\in[0,1],
+\end{equation}
+即累计信息增益占初始不确定性的比例，消除病例间初始信息量的差异。问诊按充分度分为三区，动作空间受到环境侧门控：
+\begin{equation}\label{eq:gate-rule}
+\mathrm{Gate}\bigl(u_t;\,S_t^{(i,j)}\bigr)=
+\begin{cases}
+\mathrm{DIG}\ \text{（屏蔽 WEN，连续 TALK 至多一轮）}, & S_t^{(i,j)}\ge\tau^+,\\[2pt]
+\text{结案未兑现，触发反质询}, & S_t^{(i,j)}<\tau^-\ \wedge\ u_t=\mathrm{DIG},\\[2pt]
+u_t\ \text{（自主区）}, & \text{其余}.
+\end{cases}
+\end{equation}
+强制通过受限解码实现：充分区内对高层动作分布施加 WEN 掩码，策略仍自主生成结论文本，不代写医生输出。门控与急症约束的关系：急症识别走独立的硬约束通道（第 4 节），优先级高于信息门控。
+
+\subsection{早结案的反质询与关键事实披露}
+充分度不足时医生仍给出结论，说明其结案所依据的信息不完整。此时结案不兑现（不产生 $U_i$），患者模拟器转为反质询：从必问事实集合 $E_i$ 中挑选医生最应问而未问的一条，以患者口吻主动披露或追问。披露事实的选择规则为
+\begin{equation}\label{eq:disclose}
+k^{\ast}
+=\operatorname*{argmax}_{k\,\in\,E_i\setminus C_t^{(i,j)}}
+\;\omega_k\cdot\log_2\frac{1}{\max\bigl(b_t^{(i,j)}(k),\,\varepsilon\bigr)}.
+\end{equation}
+每次反质询至多披露一条，累计披露不超过 $|E_i|$ 条；必问事实全部披露后接受结案。
+
+\begin{proposition}[终止性]\label{prop:termination}
+任一 episode 在至多 $B_i+|E_i|$ 轮内终止：反质询每轮至多消耗一条必问事实，预算与披露上限共同封顶。
+\end{proposition}
+
+该机制的训练意义：被反质询的早结案不获得终局效用，而反质询披露的事实按式 \eqref{eq:fact} 以高自信息计入过程奖励，并在下一轮信念更新中产生大的信息增益——环境把``你漏了什么''变成一次自然的、带大奖励梯度的纠正事件，替代手写的提前结案惩罚。同时它给患者模拟器的``可反问''能力一个有原则的触发条件，而非随机插入。
+
+\subsection{阈值的数据驱动标定}
+两个阈值不由人工指定，而在 86{,}517 段真实问诊上标定：以信念估计器计算真实医生结案时刻的充分度 $S_T^{\mathrm{real}}$ 的分布，取 $\tau^-$ 为其 25\% 分位数、$\tau^+$ 为其 75\% 分位数——比四分之一真实问诊更不充分的结案视为过早，比四分之三真实问诊更充分仍不结案视为拖延。该分布同时作为可行性证据与设计依据写入论文，阈值敏感性进入消融。
+
+\section{信念熵驱动的组采样与轮级优势（效率贡献）}\label{sec:group}
+
+\subsection{熵驱动的组大小与分支探索}
+GRPO 以组内相对比较替代 critic，其组构造由信念不确定性决定。对批量 $\Bcal$ 中的病例 $i$，组大小取
+\begin{equation}\label{eq:groupsize}
+n_i=\Bigl\lceil n_{\min}+(n_{\max}-n_{\min})\cdot
+\frac{H\bigl(b_0^{i}\bigr)}{\log_2(K+D)}\Bigr\rceil
+\quad\text{s.t.}\quad
+\sum_{i\in\Bcal} n_i=\lvert\Bcal\rvert\,\bar n,
+\end{equation}
+其中 $b_0^{i}$ 为病例 $i$ 初始陈述下的信念（与轨迹无关），约束保证每迭代期望 rollout 总数与均匀组大小版本相同——式 \eqref{eq:groupsize} 只改变病例间的分配而非总量（超出配额按熵降序截断）；方法间另按模拟器调用次数与生成 token 数匹配预算（$\pm2\%$），保证分配机制带来的增益不能归因于更多训练量。
+
+训练中，对 $\VoI$ 期望高（式 \eqref{eq:voi}）或信念熵超过阈值 $\tau_H$ 的轮次，额外插入分支轨迹探索不同追问方向：固定一支 DIG，其余支从 WEN 问题分布温度采样并两两去重。
+
+\subsection{轮级优势与簇内基线}
+记 $\pi_{\theta_{\mathrm{old}}}$ 为当前迭代开始时的策略快照，重要性比率为
+\begin{equation}\label{eq:ratio}
+\rho_t^{(i,j)}
+=\frac{\pi_\theta\bigl(a_t^{(i,j)}\mid h_t^{(i,j)}\bigr)}
+{\pi_{\theta_{\mathrm{old}}}\bigl(a_t^{(i,j)}\mid h_t^{(i,j)}\bigr)}.
+\end{equation}
+以事实占用向量对信念硬聚类：$g(b)=\operatorname*{argmin}_{c\in\Gcal} d\bigl(o(b),m_c\bigr)$，
+其中 $o(b)=\bigl(\1{b(f_k)\ge\delta_o}\bigr)_{k=1}^{K}$ 为占用指示向量，$m_c$ 为簇质心，$d$ 为汉明距离。轮级优势与簇内基线定义为
+\begin{equation}\label{eq:advantage}
+A_t^{(i,j)}=\tilde r_t^{(i,j)}-\mu_{g\left(b_t^{(i,j)}\right)},
+\qquad
+\mu_c=\frac{1}{\lvert\Scal_c\rvert}\!\!\sum_{(i',j',t')\in\Scal_c}\!\!\tilde r_{t'}^{(i',j')},
+\end{equation}
+其中 $\Scal_c=\{(i,j,t):\,g(b_t^{(i,j)})=c\}$ 为当前批量内落入簇 $c$ 的轮次集合；若 $\lvert\Scal_c\rvert<n_c$（取 $n_c=4$），$\mu_c$ 回退为全组轮级均值，避免小簇噪声。与 GiGPO \cite{feng2025gigpo} 的锚定态分组不同，问诊的信念轨迹几乎不出现相同状态、无法等待锚定态重现，本文以语义聚类近似``相近认识论状态下不同提问的比较''。必须配合轮级归一而非把 $\sum_t\tilde r_t$ 累积回轨迹分：累积会重新抹平逐轮信息，是消融中明确检验的一项。
+
+策略更新沿用 GRPO 的裁剪目标，附对冷启动先验 $\pi_0$ 的自适应 KL 项（实现上作用于轮级动作分布）：
+\begin{equation}\label{eq:objective}
+\mathcal{L}(\theta)=
+\E_{\Bcal}\Biggl[\frac{1}{\lvert\Bcal\rvert}\sum_{i\in\Bcal}\frac{1}{n_i}\sum_{j=1}^{n_i}
+\frac{1}{T_i+1}\sum_{t=0}^{T_i}
+\min\Bigl(\rho_t^{(i,j)} A_t^{(i,j)},\;
+\mathrm{clip}\bigl(\rho_t^{(i,j)},\,1\pm\varepsilon_{\mathrm{clip}}\bigr)A_t^{(i,j)}\Bigr)\Biggr]
+-\eta_{\mathrm{KL}}\,\E\bigl[\KL\bigl(\pi_\theta\,\|\,\pi_0\bigr)\bigr],
+\end{equation}
+$\eta_{\mathrm{KL}}$ 按 KL 距离双向调节（超目标两倍则加倍、低于一半则减半）；急症受罚轮次不参与归一化统计。与 rollout 分配家族的关系：DAPO \cite{yu2025dapo} 的动态采样按结果不确定性（组内全对/全错）过滤，UCPO、LSPO、GRESO 等按求解难度调整；本文按环境隐状态的认识论不确定性分配——``病人方向不明''与``这道题难''是正交信号，消融（表 \ref{tab:ablation} 第 ⑥ 项）中``按回报方差分配''作为 DAPO 式信号的移植对照。
+
+\section{训练课程与评测协议}
+
+\subsection{轮次课程学习}
+训练按问诊长度分三阶段课程：$C_1$（医生轮 $\le5$）$\to C_2$（6--10 轮）$\to C_3$（$>10$ 轮）。短问诊信息密度高、很快接近结案，用来先建立动作格式与结案能力；长问诊是提前结案的重灾区，信息纪律（充分性门控与反质询）集中在 $C_3$ 施加——先教``会结案''，再教``问够了才结案''。阶段切换不按固定步数，而按验证集准则
+\begin{equation}\label{eq:curriculum}
+C_k\to C_{k+1}:\quad
+\E_{\mathrm{dev}}\bigl[U\bigr]\ge\theta_k
+\ \wedge\
+\mathrm{EarlyRate}_{\mathrm{dev}}\le\delta_k,
+\end{equation}
+即效用达标且不再依赖反质询兜底时进入下一阶段。为防止短问诊先验被遗忘，每阶段按比例 $\rho=0.3$ 回放已学阶段的数据。阶段边界与语料的医生轮数分布对齐（中位数 8 轮），取 5/10 与取分布三分位数互为敏感性设置。
+
+阶段化门控配置：$C_1$ 与 $C_2$ 关闭充分性门控，仅用熵驱动的分支探索；$C_3$ 开启式 \eqref{eq:gate-rule} 的强制结案与反质询。理由：短问诊的充分度上升快，门控少触发而徒增约束；其价值集中于长问诊的提前结案抑制。门控启用阶段并入课程设计消融组。
+
+\subsection{评测协议与训练—评测差异}
+评测系统包含策略与冻结信念估计器两部分：充分性终止准则（$S_t\ge\tau^+$ 强制结案）属于系统侧停止规则，评测时保留；患者反质询属于训练环境侧的纠错事件，评测时不存在。因此需要回答``反质询带来的行为是否迁移''，论证与对策有三。其一，反质询的梯度作用点是``信息不足时不要结案''，学得的是策略侧的充分性纪律，不依赖环境兜底。其二，防``骗披露''：策略若学会故意早结案以换取披露，训练总回报反而可能升高；为此对触发反质询的结案动作施加负优势 $-\kappa$，并将触发轮从组基线中剔除，配合披露上限 $|E_i|$ 与成本项封顶。其三，评测报告早结案率（$S_T<\tau^-$ 的结案占比）与结案充分度分布 $S_T$，并设置迁移消融：训练带反质询对不带，评测一律不带，检验行为迁移。
+
+\subsection{评测的去循环化与稳健性}
+信息侧指标（$\sum_t\IG_t$、事实自信息、$H(b_T)$、无关信息获取率、充分度 $S$）一律报双口径：训练用估计器 $P_{\hat\theta}$ 与留出强估计器 $P_{\hat\theta'}$ 重算，报告两口径的病例级秩相关；关键结论以 $P_{\hat\theta'}$ 口径为准。外部锚：300 例人评中抽 100 例，由医师对每个追问的信息价值做三级标注（无价值/有价值/关键），检验信息侧指标与人类判断的一致性。模拟器骨干稳健性：主结果在固定患者模拟器上取得；稳健性实验替换第二模拟器骨干（同预算）或对其采样温度做扰动扫描，报告主端点与 H1 结论方向是否保持。上述设计针对两点质疑：奖励与指标共用同一仪器的循环性、结论对单一模拟器的过拟合。
+
+\section{方差与偏差分析}
+
+\begin{proposition}[方差结构]\label{prop:variance}
+轨迹级 GRPO 的优势以整条轨迹的回报离差为基线，方差随轮数增长；式 \eqref{eq:turn-reward} 与 \eqref{eq:advantage} 将同一总量分解为逐轮项并在簇内取基线，单轮方差只涉及 $\tilde r_t$ 的局部波动，在轮间近似独立的假设下组内轮级方差之和低于同量级的轨迹方差。本文不做更强声明，以实验报告两种口径的实际方差与收敛速度。
+\end{proposition}
+
+\textbf{偏差来源与界.}\ 信念估计误差导致 $\lvert\hat\Psi(b)-\Psi(b)\rvert\le\varepsilon_\Psi$ 时，逐轮整形偏差 $\lvert\hat r_t^{\mathrm{P}}-r_t^{\mathrm{P}}\rvert\le2\varepsilon_\Psi$；事实项 $r^{\mathrm{f}}$ 无估计误差（可离线核算）。校准信念估计器（留出集 ECE）同时收紧该界，本文报告 ECE 与端点性能的相关性。
+
+\section{算法流程}
+\begin{algorithm}[h]
+\caption{BG-GRPO（单个训练迭代）}
+\label{alg:bggrpo}
+\begin{algorithmic}[1]
+\STATE \textbf{输入：}冷启动策略 $\pi_0$、冻结估计器 $P_{\hat\theta}$、模拟器 $P_\phi$、冻结评审模型、冻结急症识别器、事实清单 $\Fhat$ 与 $E_i$
+\STATE 按式 \eqref{eq:groupsize} 为 $\Bcal$ 中病例分配组大小 $n_i$（预算约束 $\sum n_i=\lvert\Bcal\rvert\bar n$）
+\FOR{每个病例 $i$，每条轨迹 $j\in[n_i]$（并行）}
+  \FOR{$t=0,1,\dots$ 直至终止}
+    \STATE 依 $\pi_\theta$ 采样 $a_t=(u_t,m_t)$；急症命中 $\Rightarrow$ 掩码 $\mathrm{DIG}$、模板转诊、记 $-M$ 并移出归一化
+    \STATE 按 \eqref{eq:gate-rule} 执行门控：充分区屏蔽 WEN；不足区结案触发反质询 \eqref{eq:disclose}
+    \STATE 模拟器产生 $o_{t+1}\sim P_\phi(\cdot\mid s_i,a_t)$；信念前向 $b_{t+1}=\Bupd(h_t,a_t,o_{t+1})$
+    \STATE 计算逐轮奖励 $\tilde r_t$（式 \eqref{eq:turn-reward}：过程项 \eqref{eq:process} + 事实项 \eqref{eq:fact} + 终局项）
+    \IF{$\VoI(a_t\mid h_t)$ 高（式 \eqref{eq:voi}）或 $H(b_t)>\tau_H$}
+      \STATE 插入分支轨迹（一支 DIG，其余 WEN 温度采样去重）
+    \ENDIF
+  \ENDFOR
+\ENDFOR
+\STATE 计算轮级优势 $A_t^{(i,j)}$（式 \eqref{eq:advantage}，簇容量 $<n_c$ 回退全组基线）
+\STATE 按式 \eqref{eq:objective} 更新 $\theta$；自适应调节 $\eta_{\mathrm{KL}}$
+\STATE 外层按式 \eqref{eq:curriculum} 三阶段课程推进；$C_3$ 才启用门控与反质询
+\end{algorithmic}
+\end{algorithm}
+
+信用计算不消耗模拟器调用：每轮只增加一次信念前向（式 \eqref{eq:belief-update}），模拟器预算全部用于探索。
+
+\section{与近邻方法的机制差异}
+按信用分配、奖励语义与整形理论、终止控制、预算分配四个维度组织。
+
+\textbf{信用分配.}\ 经典 POMDP 对话管理 \cite{young2013pomdp} 在 belief-MDP 上求解策略，信念用于状态估计与规划本身；本文信念只作奖励与信用的度量空间，优化机器是 GRPO。SWEET-RL \cite{pan2025sweetrl} 用非对称 actor-critic（训练期 critic）与人工逐轮评估函数取轮级信用；本文 critic-free。GiGPO \cite{feng2025gigpo} 以锚定态分组恢复轮级信号，要求相同状态在组内重现；问诊信念轨迹几乎不重现，本文以信念聚类（式 \eqref{eq:advantage}）近似并补簇容量回退。GACA \cite{liang2026gaca} 按每步估计噪声自适应混合 episode/step 粒度；本文粒度固定为轮级，不确定性用于预算分配而非粒度切换。MT-GRPO \cite{zeng2025mtgrpo} 轮级归一、轨迹级奖励；本文奖励本身逐轮定义。
+
+\textbf{奖励语义与整形理论.}\ TIPS \cite{tips2026} 对通用多轮 agent 做轮级信息势整形；本文的势定义在隐状态信念上、可离线校准，并对有限期 $\gamma=1$ 下的终局残余给出显式界与语义（命题 \ref{prop:decomp}），另附模型外可验证的事实级自信息（式 \eqref{eq:fact}）。LLM 反馈势整形 \cite{pibrfs2026} 以满足 Ng 不变性为目标构造稠密奖励；本文放弃不变性、显式保留并分析终局残余。ReBel \cite{tang2026rebel} 的一致性奖励语义为``信念被观测支持''（猜得准），与问诊最优策略相悖——披露意料之外关键事实时，一致性奖励惩罚该动作，信息增益奖励按 $\IG_t$ 与自信息记功；问诊的最优策略恰是最大化信息获取（H4 直接检验该分歧）。GRPO-VPS \cite{grpovps2026} 的自概率探针需要可验证答案，问诊无可验证答案。EIG 提问选择 \cite{mazzaccara2024learning} 在推理时以期望信息增益选题；本文把信息增益作为训练奖励进入 RL 目标，并与终止门控耦合。
+
+\textbf{终止控制.}\ ATPO \cite{cao2026atpo} 无终止的充分性控制；Agentic Abstention \cite{abstention2026} 研究 agent 何时停止行动但无数据标定机制；本文以真实问诊充分度分布标定三区阈值、以反质询做环境侧纠错、并有终止性保证（命题 \ref{prop:termination}）——终止由信息量而非固定轮数决定，已有工作均未采用。
+
+\textbf{预算分配.}\ ATPO \cite{cao2026atpo} 按价值估计误差分配搜索预算；DAPO \cite{yu2025dapo} 与 UCPO、LSPO、GRESO 按结果不确定性或求解难度过滤与分配 rollout；本文按对患者隐状态的认识论不确定性（初始信念熵与 $\VoI$）分配组大小与分支预算——分配信号正交：前者度量``这道题难不难''，后者度量``这个病例的信息还缺多少''。
+
+\section{实验设计}
+
+\textbf{基础设置.}\ 基础模型 Qwen3-8B，患者模拟器、评审模型与系统提示在同一次实验内固定；训练集 86{,}517 个 episode（69{,}092/8{,}836/8{,}589 为训练/验证/测试），冷启动 SFT 用其中通过质量筛选的 22{,}909 段；各方法按患者模拟器调用次数与生成 token 数匹配预算（$\pm2\%$），每方法 3 个随机种子，报告均值与按病例组自助抽样（1{,}000 次）的 95\% 置信区间。
+
+\begin{table}[h]\centering
+\caption{基线（十组）}
+\label{tab:baseline}
+\begin{tabular}{cll}
+\toprule
+\# & 方法 & 说明 \\
+\midrule
+① & SFT & 仅冷启动 \\
+② & GRPO & 轨迹级 \\
+③ & MT-GRPO \cite{zeng2025mtgrpo} & 轮级归一、轨迹级奖励 \\
+④ & GiGPO \cite{feng2025gigpo} & 锚定态轮级分组；状态以事实占用向量定义，阈值扫描 \\
+⑤ & PPO+GAE & 在线 critic \\
+⑥ & SWEET-RL \cite{pan2025sweetrl} & 非对称 actor-critic；算力受限时降级附录 \\
+⑦ & ATPO \cite{cao2026atpo} & 等价复现，附录记录差异 \\
+⑧ & GRPO-VPS \cite{grpovps2026} 移植 & 探针改为 $P(c_i\mid h_t)$ \\
+⑨ & ReBel \cite{tang2026rebel} 移植 & 谓词取 $\Fhat$，一致性奖励按原文 \\
+⑩ & BG-GRPO（本文） & 式 \eqref{eq:turn-reward}--\eqref{eq:objective} 全量 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+④⑥ 是轮级信用最强的两个对照，算力受限时优先保证 ④。
+
+\textbf{假设与检验.}\ H1：BG-GRPO 相对各基线提高建议合理性与关键事实获取率；H2：达到验证集固定效用阈值所需的模拟器调用数显著减少；H3：跨来源泛化（留一来源协议）增益存在；H4（机制性）：一致性奖励抑制信息获取——基线⑨的事实获取率、实测信息增益与事实自信息显著低于⑩与⑧。H1--H3 经 Holm 校正，H4 单独报告效应量。
+
+\textbf{端点.}\ ①建议合理性（300 例三临床医师盲评，$\mathrm{ICC}(2,1)\ge0.75$）；②关键事实获取率（同一批病例）；③急症安全（延误轮数、识别召回率）。信息侧指标：$\sum_t\IG_t$（比特）、事实自信息总和、$H(b_T)$、无关信息获取率，双口径与外部锚见评测协议。
+
+\begin{table}[h]\centering
+\caption{消融（十四项；⑬ 为原课程三项的折半合并）}
+\label{tab:ablation}
+\begin{tabular}{cll}
+\toprule
+\# & 变量 & 设置与回答的问题 \\
+\midrule
+① & $\alpha=0$ & 过程项贡献：纯终局+事实项 \\
+② & $\beta\in\{0,.25,.5,.75,1\}$ & 纯信息势 vs 纯效用势 \\
+③ & $\lambda\in\{0,0.1,0.3\}$ & 可验证事实项贡献 \\
+④ & $\alpha$ 扫描 & 终局残余量级与 $U$ 的权衡 \\
+⑤ & 归一粒度 & $\sum\tilde r$ 累积成轨迹分 vs 轮级归一 \\
+⑥ & 组采样分配 & 熵/VoI vs 均匀 vs 回报方差（DAPO 式移植） \\
+⑦ & KL 约束 & 移除 TALK 的 KL 项 \\
+⑧ & 估计器 & 规模与 ECE 对端点的影响 \\
+⑨ & $\tau_H$ & 分支阈值扫描 \\
+⑩ & 门控开关 & 充分性门控开/关（关=仅预算终止） \\
+⑪ & $\tau^-/\tau^+$ & $S_T^{\mathrm{real}}$ 分布 10--50\% 与 50--90\% 分位扫描 \\
+⑫ & 披露规则 & 关键度加权自信息 vs 随机披露 \\
+⑬ & 课程设计 & 顺序 × 门控启用阶段 × 边界（折半设计） \\
+⑭ & 反质询迁移 & 训练带 vs 不带，评测一律不带 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{机制分析.}\ 在同一批轨迹上并行计算三类逐轮信号——信息增益 $\IG_t$、ReBel 式一致性得分、GRPO-VPS 式答案自概率变化——报告其相关矩阵与分布；选取``推翻型追问''（旧信念被否定、$\IG_t$ 高）与``反质询纠正''案例做定性对比，直接呈现三种奖励语义的分歧；报告策略与真实医生的结案充分度分布 $S_T$ 对比、终止轮数分布、反质询触发率随训练的变化；报告熵分配下的病例覆盖与每病例有效轨迹数分布，验证预算均衡声明。
+
+\section*{参考文献（本节引用）}
+\begin{thebibliography}{99}\small
+\bibitem{ng1999policy} Ng, A.~Y., Harada, D., \& Russell, S. (1999). Policy invariance under reward transformations. ICML.
+\bibitem{wiewiora2003potential} Wiewiora, E. (2003). Potential-based reward shaping and equivalent value-function initialization. ICML.
+\bibitem{shao2024deepseekmath} Shao, Z., et al. (2024). DeepSeekMath: Pushing the limits of mathematical reasoning (GRPO). arXiv:2402.03300.
+\bibitem{zeng2025mtgrpo} Zeng, S., et al. (2025). Turn-level credit assignment for multi-turn LLM agents (MT-GRPO). NeurIPS.（作者待核验）
+\bibitem{feng2025gigpo} Feng, L., et al. (2025). GiGPO: Group-in-group policy optimization for LLM agent training. arXiv:2505.10978.
+\bibitem{liang2026gaca} Liang, T., et al. (2026). Granularity-adaptive credit assignment for long-horizon LLM agents (GACA). arXiv:2609.12424.
+\bibitem{tips2026} Turn-level information-potential reward shaping (TIPS). ICLR 2026.（作者与机制细节待核验）
+\bibitem{pibrfs2026} Policy-invariant reward shaping from LLM feedback. arXiv:2608.18008.（作者待核验）
+\bibitem{pan2025sweetrl} Pan, B., et al. (2025). SWEET-RL: Training multi-turn LLM agents on collaborative reasoning tasks. arXiv:2503.15478.（作者待核验）
+\bibitem{yu2025dapo} Yu, Q., et al. (2025). DAPO: An open-source LLM reinforcement learning system at scale. arXiv:2503.14476.
+\bibitem{cao2026atpo} Cao, R., et al. (2026). ATPO: Adaptive tree policy optimization for multi-turn medical dialogue. arXiv:2603.02216.（待核验：同名工作指向 agentic 工具调用方向）
+\bibitem{grpovps2026} GRPO-VPS: Enhancing GRPO with verifiable process supervision. arXiv:2604.20659.（作者信息待补）
+\bibitem{tang2026rebel} Tang, W., Li, M., et al. (2026). Rewarding beliefs, not actions: Consistency-guided credit assignment for long-horizon agents. arXiv:2605.20061.（待核验）
+\bibitem{brown2020player} Brown, N., et al. (2020). Combining deep reinforcement learning and search for imperfect-information games. NeurIPS.
+\bibitem{luo2024meditod} Luo, Z., et al. (2024). MediTOD: Task-oriented dialogue for medical history taking with necessary-symptom annotations. EMNLP Findings.
+\bibitem{houthooft2016vime} Houthooft, R., et al. (2016). VIME: Variational information maximizing exploration. NeurIPS.
+\bibitem{mazzaccara2024learning} Mazzaccara, A., et al. (2024). Learning to ask informative questions: Enhancing LLMs in the 20-question game. arXiv:2406.17453.
+\bibitem{young2013pomdp} Young, S., Ga\v{s}i\'c, M., Thomson, B., \& Williams, J.~D. (2013). POMDP-based statistical spoken dialog systems: A review. Proc.\ IEEE, 101(5).
+\bibitem{abstention2026} Agentic abstention: Do agents know when to stop instead of act? arXiv:2606.28733.（作者待核验）
+\end{thebibliography}
+
+\textbf{引用核验清单（2026-10-28 检索）：}\cite{zeng2025mtgrpo}、\cite{tips2026}、\cite{pibrfs2026}、\cite{pan2025sweetrl}、\cite{cao2026atpo}、\cite{grpovps2026}、\cite{tang2026rebel}、\cite{abstention2026} 的作者、题目、arXiv 编号与机制描述须在投稿前逐条核实；本轮检索已确认 \cite{feng2025gigpo}、\cite{liang2026gaca}、\cite{mazzaccara2024learning} 的存在与编号，其余为公认文献。审稿人对无法核实的引用零容忍，核验未完成前不得定稿。
+
+\end{document}
